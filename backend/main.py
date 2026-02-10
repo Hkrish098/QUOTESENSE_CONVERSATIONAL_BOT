@@ -11,7 +11,7 @@ app = FastAPI(title="Nexora-Sentiobot Engine (Groq Powered)")
 
 # --- 1. CONFIGURATION ---
 # Get your key from: https://console.groq.com/
-client = Groq(api_key="YOUR_GROQ_API_KEY") 
+client = Groq(api_key="GROQ_API_KEY") 
 MODEL_NAME = "llama-3.3-70b-versatile"
 
 # Load ML Model and Features
