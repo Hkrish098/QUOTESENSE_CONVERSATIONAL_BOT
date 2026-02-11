@@ -29,11 +29,33 @@ class ChatRequest(BaseModel):
 @app.post("/chat")
 async def chat_handler(request: ChatRequest):
     user_id = request.user_id
-    user_msg = request.message
+    user_msg = request.message.lower()
 
     if user_id not in user_sessions:
         # Initialize with zeros for all 43 columns in your dataset
         user_sessions[user_id] = {feat: 0 for feat in model_features}
+        user_sessions[user_id]["stage"] = "collecting" # Track the conversation stage
+
+    session = user_sessions[user_id]
+
+    # --- NEW: HANDLE FOLLOW-UP FIRST ---
+    if session.get("stage") == "awaiting_amenities":
+        if any(word in user_msg for word in ["yes", "sure", "tell me"]):
+            # Use your dataset to find the average amenities for their zone
+            # Use your dataset to find the average amenities for their zone
+            df = pd.read_csv("cleaned_data_v2_no_leakage.csv")
+            active_zone = next((z for z in ['zone_East', 'zone_North', 'zone_South', 'zone_West'] if session.get(z) == 1), "zone_South")
+            
+            # Calculate real stats for that specific zone
+            zone_name = active_zone.split('_')[1]
+            gym_pct = round(df[df[active_zone] == 1]['gym_nearby'].mean() * 100)
+            
+            session["stage"] = "complete"
+            return {"response": f"In {zone_name} Bangalore, about {gym_pct}% of properties have a gym nearby. Anything else?", "status": "complete"}
+                
+        else:
+            session["stage"] = "complete"
+            return {"response": "No problem! Let me know if you have other rental questions.", "status": "complete"}
 
     # STEP A: Groq Feature Extraction
     # We tell the AI to map locations to zones (East, West, North, South)
@@ -81,6 +103,7 @@ async def chat_handler(request: ChatRequest):
         # Your Gradient Boosting model works its magic here
         prediction = model.predict(input_df)[0]
         
+        session["stage"] = "awaiting_amenities"
         return {
             "response": f"Excellent! For that {current_data['size_bhk']}BHK ({current_data['total_sqft']} sqft), the estimated market rent is ₹{round(prediction, -2):,}. Shall I tell you more about the nearby amenities?",
             "status": "complete"
@@ -97,3 +120,6 @@ async def chat_handler(request: ChatRequest):
             resp = f"Got it, a {current_data['size_bhk']}BHK. Roughly how many sqft is the property?"
         else:
             resp = "Just one last thing—any amenities like a gym or pool?"
+
+        # Your requested addition: Return with status "incomplete"
+        return {"response": resp, "status": "incomplete"}
