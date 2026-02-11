@@ -1,16 +1,25 @@
 import os
 import joblib
 import pandas as pd
+import json
 from groq import Groq
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Dict, List
-import json
+from typing import Dict
+from schemas import RentalState  # Import your standardized object
 
-app = FastAPI(title="Quotesense Engine (Groq Powered)")
+app = FastAPI(title="Quotesense Engine (Stateful)")
 
-# --- 1. CONFIGURATION ---
-# Get your key from: https://console.groq.com/
+# --- 1. CONFIGURATION & CORS ---
+# Enable CORS so your local frontend can talk to your deployed Render backend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], 
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 MODEL_NAME = "llama-3.3-70b-versatile"
 
@@ -18,7 +27,7 @@ MODEL_NAME = "llama-3.3-70b-versatile"
 model = joblib.load("models/blr_rent_model.joblib")
 model_features = joblib.load("models/model_features.joblib")
 
-# Session Memory
+# Session Memory (Global Dictionary)
 user_sessions: Dict[str, dict] = {}
 
 class ChatRequest(BaseModel):
@@ -28,51 +37,44 @@ class ChatRequest(BaseModel):
 # --- 2. THE CORE LOGIC ---
 @app.post("/chat")
 async def chat_handler(request: ChatRequest):
-    user_id = request.user_id
-    user_msg = request.message.lower()
+    u_id, msg = request.user_id, request.message.lower()
 
-    if user_id not in user_sessions:
-        # Initialize with zeros for all 43 columns in your dataset
-        user_sessions[user_id] = {feat: 0 for feat in model_features}
-        user_sessions[user_id]["stage"] = "collecting" # Track the conversation stage
+    # Initialize session if new
+    if u_id not in user_sessions:
+        user_sessions[u_id] = RentalState().model_dump()
+    
+    session = user_sessions[u_id]
 
-    session = user_sessions[user_id]
-
-    # --- NEW: HANDLE FOLLOW-UP FIRST ---
+    # --- STAGE A: Handle Follow-up First (The Gatekeeper) ---
     if session.get("stage") == "awaiting_amenities":
-        if any(word in user_msg for word in ["yes", "sure", "tell me"]):
-            # Use your dataset to find the average amenities for their zone
-            # Use your dataset to find the average amenities for their zone
+        if any(word in msg for word in ["yes", "sure", "tell me", "okay"]):
+            # Logic to pull average stats from your dataset
             df = pd.read_csv("cleaned_data_v2_no_leakage.csv")
             active_zone = next((z for z in ['zone_East', 'zone_North', 'zone_South', 'zone_West'] if session.get(z) == 1), "zone_South")
-            
-            # Calculate real stats for that specific zone
-            zone_name = active_zone.split('_')[1]
             gym_pct = round(df[df[active_zone] == 1]['gym_nearby'].mean() * 100)
             
             session["stage"] = "complete"
-            return {"response": f"In {zone_name} Bangalore, about {gym_pct}% of properties have a gym nearby. Anything else?", "status": "complete"}
-                
+            return {
+                "response": f"Interesting choice! In that zone, about {gym_pct}% of properties include a gym. Anything else I can help with?",
+                "status": "complete"
+            }
         else:
             session["stage"] = "complete"
-            return {"response": "No problem! Let me know if you have other rental questions.", "status": "complete"}
+            return {"response": "No problem! Let me know if you want to estimate another property.", "status": "complete"}
 
-    # STEP A: Groq Feature Extraction
-    # We tell the AI to map locations to zones (East, West, North, South)
+    # --- STAGE B: Stateful LLM Extraction (The Bucket Strategy) ---
+    # We pass the CURRENT session back to the LLM so it knows what's missing
     system_prompt = f"""
-    You are a Bangalore Real Estate Data Extractor. 
-    Extract details from the user's message into JSON.
+    You are a Bangalore Rental Expert. Extract features from the message into JSON.
+    CURRENT DATA BUCKET: {json.dumps({k: v for k, v in session.items() if v != 0})}
     
     Rules:
     1. Keys to use: {model_features}
     2. Area Mapping:
-       - East: Indiranagar, Whitefield, Marathahalli, Bellandur -> zone_East: 1
-       - North: Hebbal, Yelahanka, Manyata, RT Nagar -> zone_North: 1
-       - South: Koramangala, HSR Layout, Jayanagar, JP Nagar, Electronic City -> zone_South: 1
-       - West: Rajajinagar, Kengeri, Vijayanagar -> zone_West: 1
-    3. If they say "30k", ignore it (we are predicting rent, not filtering by it).
-    4. If they say "house" or "flat", assume size_bhk is 1 if not specified, but it's better to ask.
-    5. Return ONLY JSON.
+       - East: Indiranagar, Whitefield -> zone_East: 1, location_premium_index: 33
+       - North: Hebbal, Yelahanka -> zone_North: 1, location_premium_index: 21
+       - South: Koramangala, HSR Layout -> zone_South: 1, location_premium_index: 31
+    3. Return ONLY JSON. Do not guess values; if missing, keep them as they are in the Current Data.
     """
 
     try:
@@ -80,46 +82,40 @@ async def chat_handler(request: ChatRequest):
             model=MODEL_NAME,
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_msg}
+                {"role": "user", "content": msg}
             ],
             response_format={"type": "json_object"}
         )
         extracted_data = json.loads(completion.choices[0].message.content)
-        user_sessions[user_id].update(extracted_data)
+        session.update(extracted_data) # Update the global session state
     except Exception as e:
         print(f"Groq Error: {e}")
 
-    # STEP B: Decision Logic
-    current_data = user_sessions[user_id]
-    
-    # Check for the absolute essentials for your Gradient Boosting model
-    has_bhk = current_data.get('size_bhk', 0) > 0
-    has_sqft = current_data.get('total_sqft', 0) > 0
-    has_zone = any(current_data.get(z, 0) == 1 for z in ['zone_East', 'zone_North', 'zone_South', 'zone_West'])
+    # --- STAGE C: Decision Logic & ML Prediction ---
+    has_bhk = session.get('size_bhk', 0) > 0
+    has_sqft = session.get('total_sqft', 0) > 0
+    has_zone = any(session.get(z, 0) == 1 for z in ['zone_East', 'zone_North', 'zone_South', 'zone_West'])
 
     if has_bhk and has_sqft and has_zone:
-        # Prepare data for model
-        input_df = pd.DataFrame([current_data])[model_features]
-        # Your Gradient Boosting model works its magic here
+        # Final Bucket is full -> Run Prediction
+        input_df = pd.DataFrame([session])[model_features]
         prediction = model.predict(input_df)[0]
         
-        session["stage"] = "awaiting_amenities"
+        session["stage"] = "awaiting_amenities" # Transition to follow-up stage
+        
         return {
-            "response": f"Excellent! For that {current_data['size_bhk']}BHK ({current_data['total_sqft']} sqft), the estimated market rent is ₹{round(prediction, -2):,}. Shall I tell you more about the nearby amenities?",
-            "status": "complete"
+            "response": f"Excellent! For that {session['size_bhk']}BHK ({session['total_sqft']} sqft), the estimated market rent is ₹{round(prediction, -2):,}. Shall I tell you more about the nearby amenities?",
+            "status": "complete",
+            "prediction": round(prediction, -2),
+            "data": session
         }
     else:
-        # Conversation flow
+        # Determine what is still missing (Conversational Flow)
         if not has_zone:
-            resp = "Which area in Bangalore are you looking at? (e.g., Koramangala, Hebbal, etc.)"
+            resp = "Which area in Bangalore are you looking at? (e.g., HSR Layout, Indiranagar)"
         elif not has_bhk:
-            # Acknowledgement makes it feel human
-            area = "South Bangalore" if current_data.get('zone_South') else "that area"
-            resp = f"I've noted {area}! Are you looking for a 1BHK, 2BHK, or 3BHK?"
-        elif not has_sqft:
-            resp = f"Got it, a {current_data['size_bhk']}BHK. Roughly how many sqft is the property?"
+            resp = "Got the area! Are you looking for a 1BHK, 2BHK, or 3BHK?"
         else:
-            resp = "Just one last thing—any amenities like a gym or pool?"
+            resp = f"I've noted the {session['size_bhk']}BHK. Roughly how many sqft is the property?"
 
-        # Your requested addition: Return with status "incomplete"
-        return {"response": resp, "status": "incomplete"}
+        return {"response": resp, "status": "incomplete", "data": session}
