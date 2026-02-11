@@ -11,7 +11,7 @@ app = FastAPI(title="Nexora-Sentiobot Engine (Groq Powered)")
 
 # --- 1. CONFIGURATION ---
 # Get your key from: https://console.groq.com/
-client = Groq(api_key="GROQ_API_KEY") 
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 MODEL_NAME = "llama-3.3-70b-versatile"
 
 # Load ML Model and Features
@@ -42,14 +42,15 @@ async def chat_handler(request: ChatRequest):
     Extract details from the user's message into JSON.
     
     Rules:
-    1. Only use these keys: {model_features}
-    2. Map Bangalore areas to zones:
-       - Indiranagar, Whitefield, Marathahalli -> zone_East: 1
-       - Hebbal, Yelahanka, Manyata -> zone_North: 1
-       - Jayanagar, JP Nagar, Electronic City -> zone_South: 1
-       - Rajajinagar, Kengeri -> zone_West: 1
-    3. If a value isn't mentioned, do NOT include it in the JSON.
-    4. Return ONLY JSON.
+    1. Keys to use: {model_features}
+    2. Area Mapping:
+       - East: Indiranagar, Whitefield, Marathahalli, Bellandur -> zone_East: 1
+       - North: Hebbal, Yelahanka, Manyata, RT Nagar -> zone_North: 1
+       - South: Koramangala, HSR Layout, Jayanagar, JP Nagar, Electronic City -> zone_South: 1
+       - West: Rajajinagar, Kengeri, Vijayanagar -> zone_West: 1
+    3. If they say "30k", ignore it (we are predicting rent, not filtering by it).
+    4. If they say "house" or "flat", assume size_bhk is 1 if not specified, but it's better to ask.
+    5. Return ONLY JSON.
     """
 
     try:
@@ -87,12 +88,12 @@ async def chat_handler(request: ChatRequest):
     else:
         # Conversation flow
         if not has_zone:
-            resp = "Which area in Bangalore are you looking at? This helps me calculate the location premium."
+            resp = "Which area in Bangalore are you looking at? (e.g., Koramangala, Hebbal, etc.)"
         elif not has_bhk:
-            resp = "Got the location! Are you looking for a 1BHK, 2BHK, or something larger?"
+            # Acknowledgement makes it feel human
+            area = "South Bangalore" if current_data.get('zone_South') else "that area"
+            resp = f"I've noted {area}! Are you looking for a 1BHK, 2BHK, or 3BHK?"
         elif not has_sqft:
-            resp = f"And roughly what is the total square footage (sqft) for this {current_data['size_bhk']}BHK?"
+            resp = f"Got it, a {current_data['size_bhk']}BHK. Roughly how many sqft is the property?"
         else:
-            resp = "I'm almost ready. Does the place have any specific features like a gym or a swimming pool?"
-            
-        return {"response": resp, "status": "incomplete"}
+            resp = "Just one last thing—any amenities like a gym or pool?"
