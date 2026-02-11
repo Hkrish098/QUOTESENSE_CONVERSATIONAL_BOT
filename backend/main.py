@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from typing import Dict, List
 import json
 
-app = FastAPI(title="Nexora-Sentiobot Engine (Groq Powered)")
+app = FastAPI(title="Quotesense Engine (Groq Powered)")
 
 # --- 1. CONFIGURATION ---
 # Get your key from: https://console.groq.com/
