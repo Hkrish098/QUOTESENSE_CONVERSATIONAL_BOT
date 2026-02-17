@@ -1,48 +1,39 @@
 import os
-import joblib
-import pandas as pd
 import json
+import re
+import pandas as pd
 from groq import Groq
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Dict
-from fastapi.responses import JSONResponse
-
+from typing import Dict, List
 from dotenv import load_dotenv
+from supabase import create_client, Client
+from prompts import get_system_prompt
+
 load_dotenv()
+app = FastAPI()
 
-# Using a standard dict if schemas.py is giving issues for now
-app = FastAPI(title="Quotesense Engine (Stateful)")
-
+# --- CONFIGURATION ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"], # Explicitly allow your frontend
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# FIX: Ensure API Key is read correctly
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-if not GROQ_API_KEY:
-    print("❌ ERROR: GROQ_API_KEY not found in environment variables!")
+# Supabase Client
+supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-client = Groq(api_key=GROQ_API_KEY)
-MODEL_NAME = "llama-3.3-70b-versatile"
-
-# Global paths for Render
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE_DIR, "models/blr_rent_model.joblib")
-FEATURES_PATH = os.path.join(BASE_DIR, "models/model_features.joblib")
-CSV_PATH = os.path.join(BASE_DIR, "cleaned_data_v2_no_leakage.csv")
-
-try:
-    model = joblib.load(MODEL_PATH)
-    model_features = joblib.load(FEATURES_PATH)
-    print("✅ ML Model and Features loaded successfully.")
-except Exception as e:
-    print(f"❌ ERROR loading models: {e}")
+# We keep this for AI extraction compatibility
+MODEL_FEATURES = [
+    'location', 'size_bhk', 'total_sqft', 'rent_price_inr_per_month', 
+    'furnishing', 'bath', 'balcony', 'property_type', 'building_age', 
+    'four_wheeler_parking', 'two_wheeler_parking', 'pets_allowed', 
+    'dietary_preference', 'swimming_pool', 'gym_nearby'
+]
 
 user_sessions: Dict[str, dict] = {}
 
@@ -53,105 +44,123 @@ class ChatRequest(BaseModel):
 @app.post("/chat")
 async def chat_handler(request: ChatRequest):
     u_id, msg = request.user_id, request.message
-    print(f"--- 📨 New Message from {u_id}: {msg} ---")
     
-    # 1. Initialize session
+    # --- 1. SESSION RESET LOGIC (ADD THIS) ---
+    # Detect fresh greetings to wipe old "Ground Truth" data
+    greetings = ["hi", "hello", "hii", "hey", "reset", "start over"]
+    is_greeting = msg.lower().strip().rstrip('!') in greetings
+    
+    if is_greeting:
+        # Clear the session for this user ID
+        user_sessions[u_id] = {feat: 0 if feat != 'location' else "" for feat in MODEL_FEATURES}
+        user_sessions[u_id].update({"history": [], "property_type": "Apartment"})
+        print(f"🔄 Session reset for user: {u_id}")
+
+    # Initialize session if it doesn't exist
     if u_id not in user_sessions:
-        user_sessions[u_id] = {feat: 0 for feat in model_features}
-        user_sessions[u_id]["stage"] = "collecting"
-        print(f"🆕 Initialized new session for {u_id}")
+        user_sessions[u_id] = {feat: 0 if feat != 'location' else "" for feat in MODEL_FEATURES}
+        user_sessions[u_id].update({"history": [], "property_type": "Apartment"})
 
     session = user_sessions[u_id]
 
-    # 2. Improved System Prompt
-    system_prompt = f"""
-    You are a Bengaluru Rental Expert.
-    Current Data: {json.dumps({k: v for k, v in session.items() if v != 0 and k != "stage"})}
-    
-    Task: Extract property features into JSON using these keys: {model_features}
-    
-    Mapping Rules:
-    - Koramangala, HSR, Jayanagar, JP Nagar -> zone_South: 1
-    - Indiranagar, Whitefield, Marathahalli -> zone_East: 1
-    - Hebbal, Yelahanka, Manyata -> zone_North: 1
-    - Rajajinagar, Malleshwaram -> zone_West: 1
-    - "Swimming pool" -> swimming_pool: 1
-    
-    CRITICAL: Return ONLY JSON. If a value isn't in the message, keep it as it is in Current Data.
-    """
-
     try:
+        # 2. AI Extraction
+        system_msg = get_system_prompt(session, MODEL_FEATURES)
+        
+        # If it's a greeting, we send a shorter history so the AI 
+        # doesn't see old requirements
+        history_slice = [] if is_greeting else session["history"][-8:]
+        
         completion = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": msg}],
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": system_msg}, 
+                *history_slice, 
+                {"role": "user", "content": msg}
+            ],
             response_format={"type": "json_object"}
         )
-        extracted = json.loads(completion.choices[0].message.content)
-        print(f"📥 Groq Extracted: {extracted}")
         
-        # Clean the data (Convert None to 0)
-        for key, value in extracted.items():
-            if value is not None:
-                session[key] = value
-    except Exception as e:
-        print(f"AI Error: {e}")
-        return {"response": "I'm having a bit of a brain fog. Could you repeat that?", "status": "incomplete"}
+        res = json.loads(completion.choices[0].message.content)
+        extracted = res.get("extracted_data", {})
+        bot_reply = res.get("reply", "")
+        ai_intent = res.get("intent", "ask_more")
 
-    # 3. Decision Logic & Prediction Gate
-    has_bhk = (session.get('size_bhk') or 0) > 0
-    has_sqft = (session.get('total_sqft') or 0) > 0
-    has_zone = any((session.get(z) or 0) == 1 for z in ['zone_East', 'zone_North', 'zone_South', 'zone_West'])
+        # 2. Update Session State
+        for key, val in extracted.items():
+            if val not in [0, None, "", False]:
+                session[key] = val
 
-    # --- NEW STAGE MANAGER LOGIC ---
-    if has_bhk and has_sqft and has_zone:
-        # If we have the data but haven't asked for permission yet
-        if session.get("stage") == "collecting":
-            session["stage"] = "awaiting_confirmation"
-            area = "South" if session.get('zone_South') else "East" if session.get('zone_East') else "North" if session.get('zone_North') else "West"
-            return {
-                "response": f"Got it! I have a {session['size_bhk']}BHK in {area} Bengaluru with {session['total_sqft']} sqft. Should I run the rental estimate now?",
-                "status": "incomplete"
-            }
+        # 3. TRIGGER LOGIC (The Secure Gate)
+        trigger_words = ["show now", "list them", "search now", "ok show", "show listings", "yes", "proceed"]
+        user_forced_trigger = any(w in msg.lower() for w in trigger_words)
         
-        # If user says 'yes' or 'go ahead' while in the confirmation stage
-        if session.get("stage") == "awaiting_confirmation" and any(word in msg for word in ["yes", "yeah", "go ahead", "do it", "sure"]):
-            print("🎯 User confirmed. Running Prediction...")
-            data_for_df = {feat: [session.get(feat, 0)] for feat in model_features}
-            input_df = pd.DataFrame(data_for_df)
-            prediction = model.predict(input_df)[0]
+        has_location = session.get('location') != ""
+        has_bhk = int(float(session.get('size_bhk', 0))) > 0
+        
+        # We only trigger if: 
+        # (AI says it's ready OR user forced it) AND we have basics.
+        # This prevents the "early trigger" bug.
+        should_trigger = (ai_intent == "show_listings" or user_forced_trigger) and has_location and has_bhk
+
+        if should_trigger:
+            query = supabase.table("properties").select("*")
+            query = query.ilike("location", f"%{session.get('location')}%")
+            query = query.eq("size_bhk", int(float(session.get('size_bhk', 0))))
             
-            session["stage"] = "complete" # Move to complete
+            # Update property type if user mentioned villas/houses
+            if any(x in msg.lower() for x in ["villa", "house", "all"]):
+                session["property_type"] = "any"
+            
+            if session["property_type"] != "any":
+                query = query.eq("property_type", session["property_type"])
+
+            # Strict Budget & Sqft Filtering
+            budget = int(float(session.get('rent_price_inr_per_month', 0)))
+            if budget > 0:
+                query = query.gte("rent_price_inr_per_month", budget - 5000).lte("rent_price_inr_per_month", budget + 5000)
+
+            sqft_val = int(float(session.get('total_sqft', 0)))
+            if sqft_val > 0:
+                query = query.gte("total_sqft", int(sqft_val * 0.8)).lte("total_sqft", int(sqft_val * 1.2))
+
+            result = query.limit(20).execute()
+            
+            properties_list = []
+            for item in result.data:
+                # 1. Format Currency
+                item['formatted_rent'] = f"₹{int(item.get('rent_price_inr_per_month', 0)):,}"
+                item['formatted_deposit'] = f"₹{int(item.get('legal_security_deposit', 0)):,}"
+                
+                # 2. Add Badge Logic for the UI
+                item['parking_badge'] = "Car + Bike" if item.get('four_wheeler_parking') else "2-Wheeler"
+                item['availability_tag'] = item.get('availability', 'Immediate')
+                
+                # 3. Clean up the property name to show Society first
+                society = item.get('society', 'Independent')
+                item['display_title'] = f"{item['size_bhk']} BHK in {society}"
+                
+                properties_list.append(item)
+
+            # 4. Construct Final Response (Merge AI talk with REAL count)
+            # Remove any hallucinated "Found 20 matches" from bot_reply if AI put it there
+            clean_bot_reply = bot_reply.split("I've found")[0].strip()
+            
+            final_message = f"{clean_bot_reply}\n\nI've found {len(properties_list)} properties matching your exact criteria! 🏠✨"
+            
             return {
-                "response": f"Excellent! The estimated market rent is ₹{round(prediction, -2):,}. Shall I tell you more about the nearby amenities?",
+                "response": final_message,
                 "status": "complete",
-                "prediction": round(prediction, -2),
-                "data": {"total_sqft": session['total_sqft'], "location_name": "Bengaluru"}
+                "properties": properties_list,
+                "data": session 
             }
 
-    # --- HANDLE REPETITIVE 'YES' AFTER COMPLETION ---
-    # --- HANDLE REPETITIVE 'YES' AFTER COMPLETION ---
-    if session.get("stage") == "complete":
-        if any(word in msg.lower() for word in ["yes", "amenities", "tell me"]):
-            session["stage"] = "amenities_info"
-            return {
-                "response": "In this area, you'll find great parks and schools. Anything else I can help with?",
-                "status": "complete"
-            }
-        else:
-            return {
-                "response": "No problem! Let me know if you want to estimate another property.",
-                "status": "complete"
-            }
-    # --- 4. FINAL CATCH-ALL (Add this at the very end of the function) ---
-    if not has_zone:
-        resp = "Which part of Bengaluru are you looking in? (e.g., Koramangala, Indiranagar)"
-    elif not has_bhk:
-        resp = f"I've noted the location! Are you looking for a 1BHK, 2BHK, or 3BHK?"
-    else:
-        resp = f"Got it, a {session.get('size_bhk')}BHK. Roughly how many sqft is the property?"
+        # 5. NORMAL CONVERSATION FLOW (No search performed)
+        session["history"].append({"role": "user", "content": msg})
+        session["history"].append({"role": "assistant", "content": bot_reply})
+        
+        return {"response": bot_reply, "status": "incomplete", "data": session}
 
-    return {
-        "response": resp, 
-        "status": "incomplete", 
-        "data": session
-    }
+    except Exception as e:
+        print(f"DEBUG ERROR: {str(e)}")
+        return {"response": "I encountered a small hiccup. Please try again!", "status": "error"}
