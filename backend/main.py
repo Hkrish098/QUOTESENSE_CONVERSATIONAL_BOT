@@ -41,6 +41,22 @@ class ChatRequest(BaseModel):
     user_id: str
     message: str
 
+def safe_int(val, default=0):
+    if val is None: return default
+    try:
+        # 1. Convert to string and remove commas (handles "1,200" or "1,2")
+        str_val = str(val).replace(',', '')
+        
+        # 2. Extract all numeric sequences
+        nums = re.findall(r'\d+', str_val)
+        
+        if nums:
+            # Pick the last number found (the most recent edit)
+            return int(nums[-1])
+        return default
+    except:
+        return default
+
 @app.post("/chat")
 async def chat_handler(request: ChatRequest):
     u_id, msg = request.user_id, request.message
@@ -89,7 +105,10 @@ async def chat_handler(request: ChatRequest):
         # 2. Update Session State
         for key, val in extracted.items():
             if val not in [0, None, "", False]:
-                session[key] = val
+                if key in ['size_bhk', 'total_sqft', 'rent_price_inr_per_month']:
+                    session[key] = safe_int(val) # Using the new smart function
+                else:
+                    session[key] = val
 
         # 3. TRIGGER LOGIC (The Secure Gate)
         trigger_words = ["show now", "list them", "search now", "ok show", "show listings", "yes", "proceed"]

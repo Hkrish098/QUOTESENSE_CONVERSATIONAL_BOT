@@ -22,7 +22,9 @@ def get_system_prompt(session, model_features):
        - ONLY print labels for data you actually have in the Ground Truth.
        - Labels: 📍 Location, 📐 Size, 🛏️ BHK, 💰 Budget, 🛋️ Furnishing, 🚿 Bathrooms, 🅿️ Parking.
 
-    2. THE PARAGRAPH: After the summary, add a friendly transition paragraph.
+    2. THE PARAGRAPH: 
+       - If the user changes a previously stated requirement (e.g., "Actually, make it 1 BHK"), acknowledge it warmly: "Got it! Swapping that 2 BHK for a 1 BHK in our search. 🔄"
+       - Otherwise, add a friendly transition paragraph.
        Example: "That's a great start! To narrow this down even further, I'd love to know..."
 
     3. BUNDLING STRATEGY:
