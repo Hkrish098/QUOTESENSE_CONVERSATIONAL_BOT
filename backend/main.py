@@ -110,34 +110,33 @@ async def chat_handler(request: ChatRequest):
             query = query.ilike("location", f"%{session.get('location')}%")
             query = query.eq("size_bhk", int(float(session.get('size_bhk', 0))))
             
+            # Property Type logic
             if any(x in msg.lower() for x in ["villa", "house", "all"]):
                 session["property_type"] = "any"
             if session["property_type"] != "any":
                 query = query.eq("property_type", session["property_type"])
 
-            # Strict Filtering
-            # Inside your should_trigger block:
+            # Filter with safe integers
             budget = safe_int(session.get('rent_price_inr_per_month', 0))
             if budget > 0:
-                # Use int() to ensure we send 25000, not 25000.0
-                lower_bound = int(budget - 5000)
-                upper_bound = int(budget + 5000)
-                query = query.gte("rent_price_inr_per_month", lower_bound).lte("rent_price_inr_per_month", upper_bound)
+                query = query.gte("rent_price_inr_per_month", int(budget - 5000)).lte("rent_price_inr_per_month", int(budget + 5000))
 
             sqft_val = safe_int(session.get('total_sqft', 0))
             if sqft_val > 0:
-                lower_sqft = int(sqft_val * 0.8)
-                upper_sqft = int(sqft_val * 1.2)
-                query = query.gte("total_sqft", lower_sqft).lte("total_sqft", upper_sqft)
+                query = query.gte("total_sqft", int(sqft_val * 0.8)).lte("total_sqft", int(sqft_val * 1.2))
 
+            # Step 1: Execute the normal search
             result = query.limit(20).execute()
             properties_list = result.data
 
-            # NEW: SUGGESTION ENGINE FALLBACK
+            # Step 2: Handle 0 results with the Suggestion Engine
             if len(properties_list) == 0:
-                suggestion_msg = get_smart_suggestions(session, supabase) #
-                session["history"].append({"role": "user", "content": msg}) #
-                session["history"].append({"role": "assistant", "content": suggestion_msg}) #
+                # We only trigger this heavy logic IF the database actually returned zero
+                suggestion_msg = get_smart_suggestions(session, supabase)
+                
+                # Update history so the bot understands it just gave advice
+                session["history"].append({"role": "user", "content": msg})
+                session["history"].append({"role": "assistant", "content": suggestion_msg})
                 
                 return {
                     "response": suggestion_msg,
@@ -146,17 +145,16 @@ async def chat_handler(request: ChatRequest):
                     "data": session
                 }
 
-            # SUCCESS: Property Formatting
+            # Step 3: If properties ARE found, format and return them
             formatted_list = []
             for item in properties_list:
                 item['formatted_rent'] = f"₹{int(item.get('rent_price_inr_per_month', 0)):,}"
-                
-                # --- THIS IS THE LINE ADDED ---
                 item['formatted_deposit'] = f"₹{int(item.get('legal_security_deposit', 0)):,}"
-                # ------------------------------
-
                 item['parking_badge'] = "Car + Bike" if item.get('four_wheeler_parking') else "2-Wheeler"
-                item['display_title'] = f"{item['size_bhk']} BHK in {item.get('society', 'Independent')}"
+                
+                society = item.get('society', 'Independent')
+                item['display_title'] = f"{item['size_bhk']} BHK in {society}"
+                
                 formatted_list.append(item)
 
             clean_bot_reply = bot_reply.split("I've found")[0].strip()
@@ -168,7 +166,7 @@ async def chat_handler(request: ChatRequest):
                 "properties": formatted_list,
                 "data": session 
             }
-
+        
         # --- 5. NORMAL FLOW ---
         session["history"].append({"role": "user", "content": msg})
         session["history"].append({"role": "assistant", "content": bot_reply})
