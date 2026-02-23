@@ -14,7 +14,6 @@ from recommender import get_smart_suggestions # Import the new engine
 
 load_dotenv()
 app = FastAPI()
-
 # --- CONFIGURATION ---
 app.add_middleware(
     CORSMiddleware,
@@ -97,12 +96,12 @@ async def chat_handler(request: ChatRequest):
                     session[key] = val
 
         # --- 3. TRIGGER LOGIC ---
-        trigger_words = ["show now", "list them", "search now", "ok show", "show listings", "yes", "proceed"]
-        user_forced_trigger = any(w in msg.lower() for w in trigger_words)
+        force_pattern = r"\b(search now|show listings|list matches)\b"
+        user_forced_it = re.search(force_pattern, msg.lower())
         
         has_location = session.get('location') != ""
         has_bhk = int(float(session.get('size_bhk', 0))) > 0
-        should_trigger = (ai_intent == "show_listings" or user_forced_trigger) and has_location and has_bhk
+        should_trigger = (ai_intent == "show_listings" or user_forced_it) and has_location and has_bhk
 
         # --- 4. SEARCH & FALLBACK BLOCK ---
         if should_trigger:

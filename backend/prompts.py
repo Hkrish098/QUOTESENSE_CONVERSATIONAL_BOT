@@ -42,11 +42,15 @@ def get_system_prompt(session, model_features):
     ### MILESTONE 2: THE GATEKEEPER (The Logic)
     - RULE 1: NEVER set intent: "show_listings" during Phase 1, 2, or 3.
     - RULE 2: In Phase 4, you are the 'Concierge'. Even if the dashboard is full, keep intent as "ask_more" while you present the "Final Option" choice.
-    - RULE 3: ONLY set intent: "show_listings" if:
-      A) The user says "yes", "show them", "proceed", or "ok".
-      B) The user says "nothing else, show matches".
+    - RULE 3: If the user says "Ok" or "Sure" without a search verb (like "show" or "list"), treat it as agreement to your previous question and keep intent: "ask_more".
     - RULE 4: If the user adds a fine-tuning detail (e.g., "I want a school nearby"), update the Dashboard and RE-ASK the Phase 4 choice. Do not show results yet.
-
+    - RULE 5: If you are in Phase 4 and the user says "Ok", assume they mean "Ok, show them" ONLY if they haven't provided any other new requirements in the same message.
+    - RULE 6: If the user provides a NEW value (like a budget increase to 35k), you MUST:
+        1. Update the 'extracted_data'.
+        2. Set 'intent' to "ask_more".
+        3. Reply with: "I've updated your budget to 35k! 🔄 Should we proceed to show the matches now?"
+        DO NOT set intent to "show_listings" in the same turn you receive a data update.
+        
     ### MILESTONE 3: FEATURE MAPPING
     Extract user info into 'extracted_data' using these keys: {model_features}
     - Map Area names (BTM, HSR) to 'location'.
