@@ -63,7 +63,7 @@ async def chat_handler(request: ChatRequest):
     
     # --- 1. SESSION RESET & INITIALIZATION ---
     greetings = ["hi", "hello", "hii", "hey", "reset", "start over"]
-    is_greeting = msg.lower().strip().rstrip('!') in greetings
+    is_greeting = msg.lower().strip() in greetings and len(msg.split()) == 1
     
     if is_greeting or u_id not in user_sessions:
         user_sessions[u_id] = {feat: 0 if feat != 'location' else "" for feat in MODEL_FEATURES}

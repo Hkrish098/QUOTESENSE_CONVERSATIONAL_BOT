@@ -5,3 +5,5 @@ scikit-learn
 joblib
 groq
 python-multipart
+geopy==2.4.1
+shapely==2.0.2
