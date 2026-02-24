@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 from prompts import get_system_prompt
 from recommender import get_smart_suggestions # Import the new engine
+from geospatial import get_coordinates
 
 load_dotenv()
 app = FastAPI()
@@ -96,7 +97,7 @@ async def chat_handler(request: ChatRequest):
                     session[key] = val
 
         # --- 3. TRIGGER LOGIC ---
-        force_pattern = r"\b(search now|show listings|list matches)\b"
+        force_pattern = r"\b(search now|show listings|list matches|show the list|show them|show|list)\b"
         user_forced_it = re.search(force_pattern, msg.lower())
         
         has_location = session.get('location') != ""
@@ -156,13 +157,40 @@ async def chat_handler(request: ChatRequest):
                 
                 formatted_list.append(item)
 
+
+            family_coordinates = []
+            if session.get('family_hubs'):
+                # Note: It's cleaner to import this at the top of your file, but putting it here works for now
+                from geospatial import get_coordinates 
+                for hub in session['family_hubs']:
+                    coords = get_coordinates(hub)
+                    if coords:
+                        family_coordinates.append({
+                            "lat": coords["lat"], 
+                            "lng": coords["lng"], 
+                            "label": hub
+                        })
+
+            # --- 1. AREA RECOMMENDATION LOGIC ---
+            recommendation_text = ""
+            if session.get('family_hubs') and len(session['family_hubs']) >= 2:
+                # Joining hubs with "and" for a more natural sentence
+                hubs_str = " and ".join(session['family_hubs'])
+                recommendation_text = (
+                    f"\n\n💡 **Expert Insight:** Since your family works across {hubs_str}, "
+                    f"**{session.get('location')}** is your ideal 'Golden Midpoint'. "
+                    f"It keeps the average commute under 25 mins for everyone!"
+                )
+            # --- 2. CONSTRUCTING THE FINAL MESSAGE ---
             clean_bot_reply = bot_reply.split("I've found")[0].strip()
-            final_message = f"{clean_bot_reply}\n\nI've found {len(formatted_list)} properties matching your exact criteria! 🏠✨"
-            
+            final_message = f"{clean_bot_reply}\n\nI've found {len(formatted_list)} properties matching your exact criteria! 🏠✨{recommendation_text}"
+
+            # --- 3. THE RETURN ---
             return {
                 "response": final_message,
                 "status": "complete",
                 "properties": formatted_list,
+                "family_hubs": family_coordinates,
                 "data": session 
             }
         

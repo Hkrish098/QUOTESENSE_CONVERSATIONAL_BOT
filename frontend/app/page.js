@@ -1,95 +1,30 @@
 "use client";
 import React, { useState, useEffect, useRef } from 'react';
 import { Send, Bot, User, Loader2, MapPin, BedDouble, Heart, CheckCircle2, Building2, Home, Warehouse, TrendingUp, Sun, Moon, Sparkles, ArrowRight } from 'lucide-react';
+import dynamic from 'next/dynamic';
 
-// --- SUB-COMPONENT: Individual Property Card ---
-// --- SUB-COMPONENT: Individual Property Card ---
-const PropertyCard = ({ prop, theme }) => {
-  const [showContact, setShowContact] = useState(false);
-
-  // Function to open Google Maps with property address
-  const openGoogleMaps = () => {
-    // Uses the detailed address and location from your dataset
-    const address = `${prop.detailed_address || ""}, ${prop.location}, Bengaluru`;
-    const encodedAddress = encodeURIComponent(address);
-    window.open(`https://www.google.com/maps/search/?api=1&query=${encodedAddress}`, '_blank');
-  };
-
-  return (
-    <div className={`rounded-[2.5rem] border transition-all duration-500 overflow-hidden hover:shadow-2xl hover:-translate-y-1 group ${theme === 'dark' ? 'bg-[#111113] border-white/5 hover:border-blue-500/40' : 'bg-white border-slate-100 shadow-md'}`}>
-      
-      {/* IMAGE SECTION */}
-      <div className="h-44 relative overflow-hidden">
-        <img src="https://images.unsplash.com/photo-1493663284031-b7e3aefcae8e?w=800" className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500" alt="Home"/>
-        
-        <div className="absolute top-4 left-4 bg-blue-600/90 backdrop-blur-md text-white text-[9px] font-black px-3 py-1.5 rounded-xl uppercase tracking-widest shadow-lg">
-          {prop.availability_tag || "Ready To Move"}
-        </div>
-        
-        <div className="absolute bottom-4 left-4 bg-black/60 backdrop-blur-xl px-4 py-2 rounded-2xl border border-white/10 shadow-2xl">
-          <span className="text-sm font-black text-white">{prop.formatted_rent}</span>
-        </div>
-      </div>
-
-      {/* CONTENT SECTION */}
-      <div className="p-6">
-        <div className="flex items-center gap-1.5 text-[9px] text-emerald-400 font-black uppercase tracking-[0.15em] mb-2">
-          <MapPin size={10}/> {prop.location}
-        </div>
-        
-        <h4 className={`font-black text-[15px] mb-4 line-clamp-1 ${theme === 'dark' ? 'text-zinc-100' : 'text-slate-800'}`}>
-          {prop.display_title}
-        </h4>
-
-        {/* DEPOSIT & SPECS SECTION */}
-        <div className="flex flex-wrap gap-2 mb-6">
-          <div className="bg-blue-500/10 text-blue-500 text-[10px] font-bold px-3 py-1.5 rounded-xl flex items-center gap-1.5">
-            <BedDouble size={12}/> {prop.size_bhk} BHK
-          </div>
-          <div className="bg-emerald-500/10 text-emerald-500 text-[10px] font-bold px-3 py-1.5 rounded-xl flex items-center gap-1.5">
-            <TrendingUp size={12}/> {prop.total_sqft} Sqft
-          </div>
-          {/* THE DEPOSIT INFO */}
-          <div className="bg-orange-500/10 text-orange-500 text-[10px] font-bold px-3 py-1.5 rounded-xl">
-             Deposit: {prop.formatted_deposit || "₹" + prop.legal_security_deposit}
-          </div>
-        </div>
-
-        {/* BUTTONS SECTION */}
-        <div className="flex gap-2">
-          {/* MAP BUTTON (Replaces Arrow) */}
-          <button 
-            onClick={openGoogleMaps}
-            className="flex-1 bg-zinc-800 hover:bg-zinc-700 text-white flex items-center justify-center rounded-xl transition-all"
-            title="View on Map"
-          >
-            <MapPin size={18}/>
-          </button>
-
-          {/* GET OWNER DETAILS BUTTON (Renamed & Reveal Logic) */}
-          <button 
-            onClick={() => setShowContact(!showContact)}
-            className={`flex-[3] py-3 px-2 rounded-xl text-[9px] font-black uppercase tracking-widest transition-all shadow-lg truncate ${
-              showContact 
-              ? 'bg-white border border-emerald-500 text-emerald-600' 
-              : 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-emerald-500/20'
-            }`}
-          >
-            {showContact ? `${prop.contact_person} | ${prop.contact_number}` : "Get Owner Details"}
-          </button>
-        </div>
-      </div>
+// Update the comment so it makes sense!
+const MidpointMap = dynamic(() => import('./MidpointMap'), { 
+  ssr: false,
+  loading: () => (
+    <div className="h-full w-full flex items-center justify-center bg-zinc-900 text-emerald-500 font-black animate-pulse uppercase text-[10px]">
+      Initializing Google Maps...
     </div>
-  );
-};
+  )
+});
 
-// --- MAIN PAGE COMPONENT ---
+// --- MAIN PAGE COMPONENT (Moved to Top for Next.js) ---
 export default function Page() {
   const [theme, setTheme] = useState('dark');
   const [messages, setMessages] = useState([]); 
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [propertyList, setPropertyList] = useState([]);
+  
+  // States for Map Comparison
+  const [viewMode, setViewMode] = useState('list'); 
+  const [familyHubs, setFamilyHubs] = useState([]);
+
   const scrollRef = useRef(null);
   const userId = "krishnahonnikhere";
   const [searchHistory, setSearchHistory] = useState([]); 
@@ -129,9 +64,12 @@ export default function Page() {
         setMessages(prev => [...prev, { role: 'assistant', content: data.response }]);
         
         if (data.status === 'complete' && data.properties?.length > 0) {
+          if(data.family_hubs) setFamilyHubs(data.family_hubs);
+
           const newCapsule = {
             label: `${data.data.size_bhk} BHK in ${data.data.location}`,
             properties: data.properties,
+            familyHubs: data.family_hubs || [],
             snapshot: data.data 
           };
 
@@ -212,7 +150,7 @@ export default function Page() {
                       {searchHistory.map((cap, idx) => (
                         <button 
                             key={idx} 
-                            onClick={() => { setPropertyList(cap.properties); setActiveSearchIndex(idx); }} 
+                            onClick={() => { setPropertyList(cap.properties); setFamilyHubs(cap.familyHubs || []); setActiveSearchIndex(idx); }} 
                             className={`flex items-center gap-2 px-4 py-2 rounded-2xl text-[10px] font-black uppercase transition-all border ${activeSearchIndex === idx ? 'bg-emerald-600 border-emerald-500 text-white shadow-lg shadow-emerald-500/20' : 'bg-white/5 border-white/10 text-zinc-400 hover:bg-white/10'}`}
                         >
                           <Building2 size={12}/> {cap.label}
@@ -247,21 +185,100 @@ export default function Page() {
         <div className="flex-1 flex flex-col glass rounded-[3rem] animate-in slide-in-from-right duration-700 overflow-hidden shadow-2xl border border-white/5">
           <header className="px-10 py-8 border-b border-white/5 flex justify-between items-center bg-white/5 backdrop-blur-md">
             <div>
-              <h2 className={`text-2xl font-black ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>Top Recommendations</h2>
-              <p className="text-xs text-emerald-400 mt-1 font-bold uppercase tracking-widest">{propertyList.length} Verified Properties</p>
+              <h2 className={`text-2xl font-black ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>
+                {viewMode === 'list' ? 'Top Recommendations' : 'Golden Midpoint Map'}
+              </h2>
+              <p className="text-xs text-emerald-400 mt-1 font-bold uppercase tracking-widest">
+                {viewMode === 'list' ? `${propertyList.length} Verified Properties` : 'Commute Optimization View'}
+              </p>
             </div>
-            <button onClick={() => setPropertyList([])} className="text-zinc-500 hover:text-white p-2 transition-colors">✕</button>
+            
+            <div className="flex items-center gap-4">
+              <div className="flex bg-white/5 p-1 rounded-2xl border border-white/5">
+                <button onClick={() => setViewMode('list')} className={`px-4 py-2 rounded-xl text-[10px] font-black uppercase transition-all ${viewMode === 'list' ? 'bg-emerald-600 text-white shadow-lg' : 'text-zinc-500 hover:text-white'}`}>
+                  List
+                </button>
+                <button onClick={() => setViewMode('map')} className={`px-4 py-2 rounded-xl text-[10px] font-black uppercase transition-all ${viewMode === 'map' ? 'bg-emerald-600 text-white shadow-lg' : 'text-zinc-500 hover:text-white'}`}>
+                  Map
+                </button>
+              </div>
+              <button onClick={() => setPropertyList([])} className="text-zinc-500 hover:text-white p-2 transition-colors">✕</button>
+            </div>
           </header>
           
           <div className="flex-1 overflow-y-auto p-8 no-scrollbar bg-transparent">
-            <div className="grid grid-cols-1 xl:grid-cols-2 gap-6 content-start">
-              {propertyList.map((prop, idx) => (
-                <PropertyCard key={idx} prop={prop} theme={theme} />
-              ))}
-            </div>
+            {viewMode === 'list' ? (
+              <div className="grid grid-cols-1 xl:grid-cols-2 gap-6 content-start">
+                {propertyList.map((prop, idx) => (
+                  <PropertyCard key={idx} prop={prop} theme={theme} />
+                ))}
+              </div>
+            ) : (
+              <div className="h-full w-full rounded-[2rem] overflow-hidden border border-white/10 shadow-inner bg-zinc-950 relative">
+                {familyHubs.length > 0 || propertyList.length > 0 ? (
+                  <MidpointMap familyHubs={familyHubs} properties={propertyList} />
+                ) : (
+                  <div className="flex items-center justify-center h-full text-zinc-500">
+                    <p className="font-black uppercase tracking-widest text-[10px]">No Map Data Available</p>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </div>
       )}
     </div>
   );
 }
+
+// --- SUB-COMPONENT: Individual Property Card (Moved to bottom) ---
+const PropertyCard = ({ prop, theme }) => {
+  const [showContact, setShowContact] = useState(false);
+
+  const openGoogleMaps = () => {
+    const address = `${prop.detailed_address || ""}, ${prop.location}, Bengaluru`;
+    const encodedAddress = encodeURIComponent(address);
+    window.open(`https://www.google.com/maps/search/?api=1&query=${encodedAddress}`, '_blank');
+  };
+
+  return (
+    <div className={`rounded-[2.5rem] border transition-all duration-500 overflow-hidden hover:shadow-2xl hover:-translate-y-1 group ${theme === 'dark' ? 'bg-[#111113] border-white/5 hover:border-blue-500/40' : 'bg-white border-slate-100 shadow-md'}`}>
+      <div className="h-44 relative overflow-hidden">
+        <img src="https://images.unsplash.com/photo-1493663284031-b7e3aefcae8e?w=800" className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500" alt="Home"/>
+        <div className="absolute top-4 left-4 bg-blue-600/90 backdrop-blur-md text-white text-[9px] font-black px-3 py-1.5 rounded-xl uppercase tracking-widest shadow-lg">
+          {prop.availability_tag || "Ready To Move"}
+        </div>
+        <div className="absolute bottom-4 left-4 bg-black/60 backdrop-blur-xl px-4 py-2 rounded-2xl border border-white/10 shadow-2xl">
+          <span className="text-sm font-black text-white">{prop.formatted_rent}</span>
+        </div>
+      </div>
+      <div className="p-6">
+        <div className="flex items-center gap-1.5 text-[9px] text-emerald-400 font-black uppercase tracking-[0.15em] mb-2">
+          <MapPin size={10}/> {prop.location}
+        </div>
+        <h4 className={`font-black text-[15px] mb-4 line-clamp-1 ${theme === 'dark' ? 'text-zinc-100' : 'text-slate-800'}`}>
+          {prop.display_title}
+        </h4>
+        <div className="flex flex-wrap gap-2 mb-6">
+          <div className="bg-blue-500/10 text-blue-500 text-[10px] font-bold px-3 py-1.5 rounded-xl flex items-center gap-1.5">
+            <BedDouble size={12}/> {prop.size_bhk} BHK
+          </div>
+          <div className="bg-emerald-500/10 text-emerald-500 text-[10px] font-bold px-3 py-1.5 rounded-xl flex items-center gap-1.5">
+            <TrendingUp size={12}/> {prop.total_sqft} Sqft
+          </div>
+          <div className="bg-orange-500/10 text-orange-500 text-[10px] font-bold px-3 py-1.5 rounded-xl">
+             Deposit: {prop.formatted_deposit || "₹" + prop.legal_security_deposit}
+          </div>
+        </div>
+        <div className="flex gap-2">
+          <button onClick={openGoogleMaps} className="flex-1 bg-zinc-800 hover:bg-zinc-700 text-white flex items-center justify-center rounded-xl transition-all" title="View on Map">
+            <MapPin size={18}/>
+          </button>
+          <button onClick={() => setShowContact(!showContact)} className={`flex-[3] py-3 px-2 rounded-xl text-[9px] font-black uppercase tracking-widest transition-all shadow-lg truncate ${showContact ? 'bg-white border border-emerald-500 text-emerald-600' : 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-emerald-500/20'}`}>
+            {showContact ? `${prop.contact_person} | ${prop.contact_number}` : "Get Owner Details"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
