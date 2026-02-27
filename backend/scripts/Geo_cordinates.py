@@ -5,38 +5,27 @@ from dotenv import load_dotenv
 from supabase import create_client
 import googlemaps
 
-#we need to load the environment files from the backend
+# 1. LOAD ENV FROM BACKEND FOLDER
 env_path = os.path.join(os.path.dirname(__file__), '..', '.env')
-load_dotenv(dotenv_path = env_path)
+load_dotenv(dotenv_path=env_path)
 
-#get keys from the env
+# 2. GET KEYS FROM ENV
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
 
-if not all([SUPABASE_URL, SUPABASE_KEY ,GOOGLE_MAPS_API_KEY ]):
-    print(" the one of 3 keys is missing find the subpabase keys on supabase and google key in env and put it here!!.")
+if not all([SUPABASE_URL, SUPABASE_KEY, GOOGLE_MAPS_API_KEY]):
+    print("❌ Error: Missing API keys in .env file.")
     exit()
 
-#now initialize client
+# 3. INITIALIZE CLIENTS
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 gmaps = googlemaps.Client(key=GOOGLE_MAPS_API_KEY)
 
-#configuring to 100 rows not to exceed the limit and not burden the API
-
-DAILY_BUDGET_COUNT = 1000
-BATCH_SIZE = 50
-
-TEST_LOCATIONS = [
-    "Koramangala", 
-    "HSR Layout", 
-    "Marathahalli", 
-    "JP Nagar", 
-    "Banashankari", 
-    "Jayanagar"
-]
-
-total_updated_this_run =0
+# --- CONFIGURATION ---
+DAILY_BUDGET_COUNT = 1500  # Will process 1000 rows today
+BATCH_SIZE = 50            # Fetch 50 at a time
+total_updated_this_run = 0
 
 def geocode_batch():
     global total_updated_this_run
@@ -44,10 +33,10 @@ def geocode_batch():
     if total_updated_this_run >= DAILY_BUDGET_COUNT:
         return False
     
-    # geo encoding for the 6 locations for now
+    # --- CHANGE MADE HERE: Removed the .in_("location", TEST_LOCATIONS) filter ---
+    # This now targets ANY row in ANY location where latitude is null
     response = supabase.table("properties") \
         .select("listing_id, detailed_address, location") \
-        .in_("location", TEST_LOCATIONS) \
         .is_("latitude", "null") \
         .limit(BATCH_SIZE) \
         .execute()
@@ -55,15 +44,12 @@ def geocode_batch():
     rows = response.data
 
     if not rows:
-        print("no more empty data for the coordinates in the selected 6 locations")
-        print("to do the geo encoding for tomorrrow / for all locations just remove the TEST_LOCATION form the responce code.")
-
+        print("✅ SUCCESS: All properties in the database are now geocoded!")
         return False
     
     for row in rows:
-        # Check limit inside loop in case we hit it mid-batch
         if total_updated_this_run >= DAILY_BUDGET_COUNT:
-            print(f" Reached daily limit of {DAILY_BUDGET_COUNT}. Stopping.")
+            print(f"🛑 Reached daily limit of {DAILY_BUDGET_COUNT}. Stopping.")
             return False
 
         address = row['detailed_address']
@@ -71,40 +57,38 @@ def geocode_batch():
         area = row['location']
 
         try:
-            #google maps API call
+            # Google Maps API call
             result = gmaps.geocode(f"{address}, Bengaluru")
 
             if result:
                 loc = result[0]['geometry']['location']
                 lat, lng = loc['lat'], loc['lng']
 
+                # Update the row in Supabase
                 supabase.table("properties") \
                     .update({"latitude": lat, "longitude": lng}) \
                     .eq("listing_id", l_id) \
                     .execute()
                     
                 total_updated_this_run += 1
-                print(f"[{total_updated_this_run}/{DAILY_BUDGET_COUNT}] Updated {area}: {l_id} -> {lat}, {lng}")
+                print(f"[{total_updated_this_run}/{DAILY_BUDGET_COUNT}] Updated {area}: {l_id}")
             else:
-                print(f" Skip: Could not find coordinates for {address}")
+                print(f"⚠️ Skip: Could not find coordinates for {address}")
 
         except Exception as e:
-            print(f"error on{l_id}:e")
+            print(f"❌ Error on {l_id}: {e}")
             time.sleep(2)
 
-        #now protect the API so keep a timer netween each call 
-        time .sleep(random.uniform(0.6,1.2))
-
+        # Protect API with random delay
+        time.sleep(random.uniform(0.6, 1.2))
 
     return True
 
 if __name__ == "__main__":
-    print(f"🚀 Starting Test Batch for: {', '.join(TEST_LOCATIONS)}")
-    print(f"Target: {DAILY_BUDGET_COUNT} rows.")
+    print(f"🚀 Starting Production Geocoding for ALL Bengaluru locations...")
+    print(f"Targeting {DAILY_BUDGET_COUNT} properties for this run.")
     
     while geocode_batch():
-        print(f"--- Completed batch. Total so far: {total_updated_this_run} ---")
+        print(f"--- Batch complete. Total updated so far: {total_updated_this_run} ---")
         
     print(f"🏁 Geocoding finished. Total properties updated: {total_updated_this_run}")
-
-        

@@ -8,10 +8,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict, List
 from dotenv import load_dotenv
-from supabase import create_client, Client
+from supabase import create_client, Client,ClientOptions
 from prompts import get_system_prompt
 from recommender import get_smart_suggestions # Import the new engine
 from geospatial import get_coordinates
+import time
 
 load_dotenv()
 app = FastAPI()
@@ -24,8 +25,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Supabase Client
-supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+options = ClientOptions(
+    postgrest_client_timeout=60, # This is the correct way to set 30s timeout
+    headers={'X-Client-Info': 'tatva-ai-backend'}
+)
+
+supabase: Client = create_client(
+    os.getenv("SUPABASE_URL"), 
+    os.getenv("SUPABASE_KEY"),
+    options=options
+)
+
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 # We keep this for AI extraction compatibility
@@ -33,7 +43,8 @@ MODEL_FEATURES = [
     'location', 'size_bhk', 'total_sqft', 'rent_price_inr_per_month', 
     'furnishing', 'bath', 'balcony', 'property_type', 'building_age', 
     'four_wheeler_parking', 'two_wheeler_parking', 'pets_allowed', 
-    'dietary_preference', 'swimming_pool', 'gym_nearby'
+    'dietary_preference', 'swimming_pool', 'gym_nearby',
+    'marital_status', 'family_hubs' # AI will extract these into the session
 ]
 
 user_sessions: Dict[str, dict] = {}
@@ -45,16 +56,11 @@ class ChatRequest(BaseModel):
 def safe_int(val, default=0):
     if val is None: return default
     try:
-        # 1. Convert to string and remove commas (handles "1,200" or "1,2")
-        str_val = str(val).replace(',', '')
-        
-        # 2. Extract all numeric sequences
+        # Convert to string, take part before decimal, remove commas
+        # "31250.0" -> "31250"
+        str_val = str(val).split('.')[0].replace(',', '')
         nums = re.findall(r'\d+', str_val)
-        
-        if nums:
-            # Pick the last number found (the most recent edit)
-            return int(nums[-1])
-        return default
+        return int(nums[-1]) if nums else default
     except:
         return default
 
@@ -96,102 +102,134 @@ async def chat_handler(request: ChatRequest):
                 else:
                     session[key] = val
 
-        # --- 3. TRIGGER LOGIC ---
-        force_pattern = r"\b(search now|show listings|list matches|show the list|show them|show|list)\b"
-        user_forced_it = re.search(force_pattern, msg.lower())
+       # --- 3. TRIGGER LOGIC (The Secure Gate) ---
+        # 1. Define mandatory essentials for a valid search
+        essentials = ['location', 'size_bhk', 'rent_price_inr_per_month','marital_status', 'family_hubs']
+        has_all_data = all(session.get(k) not in [0, "", None, []] for k in essentials)
         
-        has_location = session.get('location') != ""
-        has_bhk = int(float(session.get('size_bhk', 0))) > 0
-        should_trigger = (ai_intent == "show_listings" or user_forced_it) and has_location and has_bhk
+        # 2. Strict Regex for User Commands
+        # This ensures words like "yes" or "ok" don't trigger unless a search verb is used
+        force_pattern = r"\b(show|list|search|fetch|find|proceed|see matches)\b"
+        user_wants_listings = re.search(force_pattern, msg.lower())
 
-        # --- 4. SEARCH & FALLBACK BLOCK ---
+        # 3. Decision Matrix
+        # Trigger ONLY IF: (AI says ready OR User forced it) AND we have the core data.
+        should_trigger = (ai_intent == "show_listings" or has_all_data) and user_wants_listings
+
+        # --- 4. SEARCH & FALLBACK BLOCK (STABILIZED WITH RETRY) ---
         if should_trigger:
             query = supabase.table("properties").select("*")
-            query = query.ilike("location", f"%{session.get('location')}%")
-            query = query.eq("size_bhk", int(float(session.get('size_bhk', 0))))
             
-            # Property Type logic
-            if any(x in msg.lower() for x in ["villa", "house", "all"]):
-                session["property_type"] = "any"
-            if session["property_type"] != "any":
-                query = query.eq("property_type", session["property_type"])
+            # --- PHASE 1: GEOSPATIAL FILTERS ---
+            family_coords = []
+            if session.get('family_hubs'):
+                for hub in session['family_hubs']:
+                    try:
+                        c = get_coordinates(hub)
+                        if c: family_coords.append(c)
+                    except: continue
 
-            # Filter with safe integers
+            if len(family_coords) >= 2:
+                # FAMILY MODE: Center-point search (FASTEST)
+                avg_lat = sum(c['lat'] for c in family_coords) / len(family_coords)
+                avg_lng = sum(c['lng'] for c in family_coords) / len(family_coords)
+                buffer = 0.04 
+                query = query.gte("latitude", avg_lat - buffer).lte("latitude", avg_lat + buffer)
+                query = query.gte("longitude", avg_lng - buffer).lte("longitude", avg_lng + buffer)
+                print(f"👨‍👩‍👧‍👦 Family Center-Point Search: {avg_lat}, {avg_lng}")
+
+            elif len(family_coords) == 1:
+                # SOLO MODE: 2km radius
+                lat, lng = family_coords[0]['lat'], family_coords[0]['lng']
+                buffer = 0.015
+                query = query.gte("latitude", lat - buffer).lte("latitude", lat + buffer)
+                query = query.gte("longitude", lng - buffer).lte("longitude", lng + buffer)
+                print("👤 Solo Radius Search")
+
+            else:
+                # TEXT MODE: ilike search
+                query = query.ilike("location", f"%{session.get('location')}%")
+                print("📍 Text Search")
+
+            # --- PHASE 2: ATTRIBUTE FILTERS ---
+            query = query.eq("size_bhk", safe_int(session.get('size_bhk', 0)))
+            
             budget = safe_int(session.get('rent_price_inr_per_month', 0))
             if budget > 0:
-                query = query.gte("rent_price_inr_per_month", int(budget - 5000)).lte("rent_price_inr_per_month", int(budget + 5000))
+                query = query.lte("rent_price_inr_per_month", int(budget + 5000))
 
-            sqft_val = safe_int(session.get('total_sqft', 0))
-            if sqft_val > 0:
-                query = query.gte("total_sqft", int(sqft_val * 0.8)).lte("total_sqft", int(sqft_val * 1.2))
+            if "independent" in str(session.get('property_type', '')).lower():
+                query = query.ilike("property_type", "Independent House")
 
-            # Step 1: Execute the normal search
-            result = query.limit(20).execute()
-            properties_list = result.data
+            # --- PHASE 3: EXECUTION (RETRY LOOP) ---
+            properties_list = []
+            for attempt in range(3): 
+                try:
+                    # Execute exactly ONCE here after all filters are set
+                    result = query.limit(50).execute()
+                    properties_list = result.data
+                    break 
+                except Exception as dbe:
+                    print(f"DB Attempt {attempt+1} failed: {dbe}")
+                    time.sleep(1)
 
-            # Step 2: Handle 0 results with the Suggestion Engine
+            # --- PHASE 4: UI FORMATTING ---
             if len(properties_list) == 0:
-                # We only trigger this heavy logic IF the database actually returned zero
-                suggestion_msg = get_smart_suggestions(session, supabase)
-                
-                # Update history so the bot understands it just gave advice
-                session["history"].append({"role": "user", "content": msg})
-                session["history"].append({"role": "assistant", "content": suggestion_msg})
-                
-                return {
-                    "response": suggestion_msg,
-                    "status": "suggestion", 
-                    "properties": [],
-                    "data": session
-                }
+                # If no houses found, run the smart suggestion engine
+                return {"response": get_smart_suggestions(session, supabase), "status": "suggestion", "properties": [], "data": session}
 
-            # Step 3: If properties ARE found, format and return them
+            # If we found houses, format them for the UI cards
             formatted_list = []
             for item in properties_list:
                 item['formatted_rent'] = f"₹{int(item.get('rent_price_inr_per_month', 0)):,}"
-                item['formatted_deposit'] = f"₹{int(item.get('legal_security_deposit', 0)):,}"
-                item['parking_badge'] = "Car + Bike" if item.get('four_wheeler_parking') else "2-Wheeler"
-                
-                society = item.get('society', 'Independent')
-                item['display_title'] = f"{item['size_bhk']} BHK in {society}"
-                
+                item['display_title'] = f"{item['size_bhk']} BHK in {item.get('society', 'Independent')}"
                 formatted_list.append(item)
 
+            # --- PHASE 5: DYNAMIC PERSONALIZATION (Add this now) ---
+            # 5.1 Calculate the Map Bounds (search_zone)
+            search_zone = None
+            if family_coords:
+                lats = [c['lat'] for c in family_coords]
+                lngs = [c['lng'] for c in family_coords]
+                # We add a small buffer (0.02) to the box so it's not too tight
+                search_zone = {
+                    "min_lat": min(lats) - 0.02,
+                    "max_lat": max(lats) + 0.02,
+                    "min_lng": min(lngs) - 0.02,
+                    "max_lng": max(lngs) + 0.02,
+                    "center": {"lat": sum(lats)/len(lats), "lng": sum(lngs)/len(lngs)}
+                }
 
-            family_coordinates = []
-            if session.get('family_hubs'):
-                # Note: It's cleaner to import this at the top of your file, but putting it here works for now
-                from geospatial import get_coordinates 
-                for hub in session['family_hubs']:
-                    coords = get_coordinates(hub)
-                    if coords:
-                        family_coordinates.append({
-                            "lat": coords["lat"], 
-                            "lng": coords["lng"], 
-                            "label": hub
-                        })
-
-            # --- 1. AREA RECOMMENDATION LOGIC ---
-            recommendation_text = ""
-            if session.get('family_hubs') and len(session['family_hubs']) >= 2:
-                # Joining hubs with "and" for a more natural sentence
-                hubs_str = " and ".join(session['family_hubs'])
+            # 5.2 Recommendation Text (Solo vs Family)
+            if session.get('marital_status') in ['Married', 'Family'] or len(family_coords) >= 2:
+                hubs_str = " and ".join(session.get('family_hubs', ['work/school']))
                 recommendation_text = (
-                    f"\n\n💡 **Expert Insight:** Since your family works across {hubs_str}, "
-                    f"**{session.get('location')}** is your ideal 'Golden Midpoint'. "
-                    f"It keeps the average commute under 25 mins for everyone!"
+                    f"\n\n💡 **Tatva Family Insight:** I've prioritized the **Golden Midpoint** "
+                    f"between {hubs_str} to ensure your family spends less time in traffic! 👨‍👩‍👧‍👦"
                 )
-            # --- 2. CONSTRUCTING THE FINAL MESSAGE ---
-            clean_bot_reply = bot_reply.split("I've found")[0].strip()
-            final_message = f"{clean_bot_reply}\n\nI've found {len(formatted_list)} properties matching your exact criteria! 🏠✨{recommendation_text}"
+            else:
+                hubs = session.get('family_hubs', [])
+                hub_name = hubs[0] if hubs else "your workplace"
+                recommendation_text = (
+                    f"\n\n💡 **Tatva Solo Insight:** Since you're moving solo to be near **{hub_name}**, "
+                    f"I've optimized for a **15-minute 'Stress-Free' radius**. Welcome to the city! 🚀"
+                )
+                
+            # Define a default center if everything else fails
+            default_center = {"lat": 12.9716, "lng": 77.5946}
+            final_zone = search_zone if search_zone else {"center": family_coords[0] if family_coords else default_center}
 
-            # --- 3. THE RETURN ---
+            # Construct the final text response
+            clean_bot_reply = bot_reply.split("found")[0].strip()
+            final_message = f"{clean_bot_reply}\n\nI've found {len(formatted_list)} matches! 🏠✨{recommendation_text}"
+
             return {
                 "response": final_message,
                 "status": "complete",
                 "properties": formatted_list,
-                "family_hubs": family_coordinates,
-                "data": session 
+                "search_zone": final_zone, 
+                "family_hubs": family_coords,
+                "data": session
             }
         
         # --- 5. NORMAL FLOW ---

@@ -15,7 +15,7 @@ const MidpointMap = dynamic(() => import('./MidpointMap'), {
 
 // --- MAIN PAGE COMPONENT (Moved to Top for Next.js) ---
 export default function Page() {
-  const [theme, setTheme] = useState('dark');
+  const [theme, setTheme] = useState('light');
   const [messages, setMessages] = useState([]); 
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -216,7 +216,7 @@ export default function Page() {
             ) : (
               <div className="h-full w-full rounded-[2rem] overflow-hidden border border-white/10 shadow-inner bg-zinc-950 relative">
                 {familyHubs.length > 0 || propertyList.length > 0 ? (
-                  <MidpointMap familyHubs={familyHubs} properties={propertyList} />
+                  <MidpointMap familyHubs={familyHubs} properties={propertyList} searchZone={searchHistory[activeSearchIndex]?.searchZone} />
                 ) : (
                   <div className="flex items-center justify-center h-full text-zinc-500">
                     <p className="font-black uppercase tracking-widest text-[10px]">No Map Data Available</p>
