@@ -10,8 +10,21 @@ const BoundaryDrawing = ({ hubs, searchZone }) => {
     if (!map) return;
     let drawing = null;
 
-    // IF BACKEND SENT A SPECIFIC SEARCH ZONE (The Emerald Box)
-    if (searchZone) {
+    // --- CASE 1: SOLO (1 Hub) -> Show the 15-min Circle ---
+    if (hubs.length === 1) {
+      drawing = new window.google.maps.Circle({
+        center: { lat: parseFloat(hubs[0].lat), lng: parseFloat(hubs[0].lng) },
+        radius: 2000, // 2km radius
+        strokeColor: "#10b981",
+        strokeOpacity: 0.8,
+        strokeWeight: 2,
+        fillColor: "#10b981",
+        fillOpacity: 0.15,
+      });
+    }
+    // --- CASE 2: FAMILY/COUPLE (2+ Hubs) -> Show the Emerald Box ---
+    // We prioritize the searchZone rectangle for 2 hubs to show the midpoint
+    else if (searchZone && hubs.length === 2) {
       drawing = new window.google.maps.Rectangle({
         bounds: {
           north: searchZone.max_lat,
@@ -26,7 +39,7 @@ const BoundaryDrawing = ({ hubs, searchZone }) => {
         fillOpacity: 0.15,
       });
     } 
-    // FALLBACK: If we just have raw hubs (Legacy mode)
+    // --- CASE 3: MULTI-HUB (3+ Hubs) -> Show the Polygon ---
     else if (hubs.length >= 3) {
       drawing = new window.google.maps.Polygon({
         paths: hubs.map(h => ({ lat: parseFloat(h.lat), lng: parseFloat(h.lng) })),

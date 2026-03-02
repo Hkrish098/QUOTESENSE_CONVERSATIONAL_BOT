@@ -13,13 +13,14 @@ from prompts import get_system_prompt
 from recommender import get_smart_suggestions # Import the new engine
 from geospatial import get_coordinates
 import time
+from fastapi.responses import JSONResponse
 
 load_dotenv()
 app = FastAPI()
 # --- CONFIGURATION ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"], 
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "https://quotesense-conversational-bot.vercel.app"], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -69,40 +70,65 @@ async def chat_handler(request: ChatRequest):
     u_id, msg = request.user_id, request.message
     
     # --- 1. SESSION RESET & INITIALIZATION ---
-    greetings = ["hi", "hello", "hii", "hey", "reset", "start over"]
-    is_greeting = msg.lower().strip() in greetings and len(msg.split()) == 1
+    greetings = ["hi", "hello", "hii", "hey", "reset", "start over", "start"]
+    is_greeting = msg.lower().strip() in greetings and len(msg.split()) <= 2
     
     if is_greeting or u_id not in user_sessions:
         user_sessions[u_id] = {feat: 0 if feat != 'location' else "" for feat in MODEL_FEATURES}
-        user_sessions[u_id].update({"history": [], "property_type": "Apartment"})
+        user_sessions[u_id].update({"history": [], "property_type": "Apartment", "family_hubs": [],"marital_status": ""})
+        print(f"🔄 Session Reset for User: {u_id}")
+        print(f"Time: {time.strftime('%H:%M:%S')}")
 
     session = user_sessions[u_id]
 
     try:
-        # --- 2. AI EXTRACTION ---
-        system_msg = get_system_prompt(session, MODEL_FEATURES)
-        history_slice = [] if is_greeting else session["history"][-8:]
+        # --- 2. DUAL-MODEL STRATEGY ---
         
-        completion = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "system", "content": system_msg}, *history_slice, {"role": "user", "content": msg}],
-            response_format={"type": "json_object"}
+        # CALL A: The "Worker" (Llama-3-8b) for Data Extraction
+        # We must provide the MODEL_FEATURES and current session so the model knows what to update.
+        extraction_system_msg = (
+            f"You are a rental data extractor. Analyze the user message and update these fields: {MODEL_FEATURES}. "
+            f"Current Session State: {session}. Return ONLY a JSON object with the updated values."
         )
         
-        res = json.loads(completion.choices[0].message.content)
-        extracted = res.get("extracted_data", {})
-        bot_reply = res.get("reply", "")
-        ai_intent = res.get("intent", "ask_more")
+        try:
+            extract_completion = client.chat.completions.create(
+                model="llama-3.1-8b-instant", 
+                messages=[
+                    {"role": "system", "content": extraction_system_msg},
+                    {"role": "user", "content": msg}
+                ],
+                response_format={"type": "json_object"}
+            )
+            
+            extracted = json.loads(extract_completion.choices[0].message.content)
+            
+            # Update Session State with extracted data
+            for key, val in extracted.items():
+                if val not in [0, None, "", False]:
+                    if key in ['size_bhk', 'total_sqft', 'rent_price_inr_per_month']:
+                        session[key] = safe_int(val)
+                    else:
+                        session[key] = val
+        except Exception as ex_err:
+            print(f"⚠️ Extraction Warning: {ex_err}")
+            # We don't crash here; the 70b model can still handle the chat.
 
-        # Update Session State
-        for key, val in extracted.items():
-            if val not in [0, None, "", False]:
-                if key in ['size_bhk', 'total_sqft', 'rent_price_inr_per_month']:
-                    session[key] = safe_int(val)
-                else:
-                    session[key] = val
+        # CALL B: The "Consultant" (Llama-3.3-70b) for Expert Conversation
+        system_msg = get_system_prompt(session, MODEL_FEATURES)
+        system_msg += "\nOutput ONLY your conversational response. Do not include JSON or internal tags."
 
-       # --- 3. TRIGGER LOGIC (The Secure Gate) ---
+        history_slice = [] if is_greeting else session["history"][-4:]
+        
+        chat_completion = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "system", "content": system_msg}, *history_slice, {"role": "user", "content": msg}]
+        )
+        
+        bot_reply = chat_completion.choices[0].message.content
+        ai_intent = "show_listings" if any(x in bot_reply.lower() for x in ["found", "matches", "here are"]) else "ask_more"
+
+        # --- 3. TRIGGER LOGIC (The Secure Gate) ---
         # 1. Define mandatory essentials for a valid search
         essentials = ['location', 'size_bhk', 'rent_price_inr_per_month','marital_status', 'family_hubs']
         has_all_data = all(session.get(k) not in [0, "", None, []] for k in essentials)
@@ -128,6 +154,10 @@ async def chat_handler(request: ChatRequest):
                         c = get_coordinates(hub)
                         if c: family_coords.append(c)
                     except: continue
+            # This ensures that even in "Midpoint Mode," we only show specific area
+            loc_input = session.get('location', '').strip()
+            if loc_input:
+                query = query.ilike("location", f"%{loc_input}%")
 
             if len(family_coords) >= 2:
                 # FAMILY MODE: Center-point search (FASTEST)
@@ -223,20 +253,36 @@ async def chat_handler(request: ChatRequest):
             clean_bot_reply = bot_reply.split("found")[0].strip()
             final_message = f"{clean_bot_reply}\n\nI've found {len(formatted_list)} matches! 🏠✨{recommendation_text}"
 
-            return {
-                "response": final_message,
-                "status": "complete",
-                "properties": formatted_list,
-                "search_zone": final_zone, 
-                "family_hubs": family_coords,
-                "data": session
-            }
+            return JSONResponse(
+                content = {
+                    "response": final_message,
+                    "status": "complete",
+                    "properties": formatted_list,
+                    "search_zone": final_zone, 
+                    "family_hubs": family_coords,
+                    "data": session
+                }
+            )
+
         
         # --- 5. NORMAL FLOW ---
         session["history"].append({"role": "user", "content": msg})
         session["history"].append({"role": "assistant", "content": bot_reply})
-        return {"response": bot_reply, "status": "incomplete", "data": session}
+        return JSONResponse(
+            content={
+                "response": bot_reply, 
+                "status": "incomplete", 
+                "data": session
+            }
+        )
 
     except Exception as e:
         print(f"DEBUG ERROR: {str(e)}")
-        return {"response": "I encountered a small hiccup. Please try again!", "status": "error"}
+        return JSONResponse(
+            status_code=500,
+            content={
+                "response": "I encountered a small hiccup. Please try again!", 
+                "status": "error",
+                "debug": str(e)
+            }
+        )

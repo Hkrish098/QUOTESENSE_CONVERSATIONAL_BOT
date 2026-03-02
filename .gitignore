@@ -1,6 +1,7 @@
 # Ignore the environment secrets
 .env
 backend/.env
+.env.local
 
 # Ignore virtual environments
 .venv/
