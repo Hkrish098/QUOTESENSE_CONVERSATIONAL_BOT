@@ -32,7 +32,7 @@ export default function Page() {
 
   const templates = [
     { title: 'Apartments', prompt: 'I need a semi-furnished 2BHK in HSR Layout', icon: Building2, color: 'text-blue-500', bg: 'bg-blue-500/10' },
-    { title: 'Independent Villas', prompt: 'Find luxury villas in Whitefield with a gym', icon: Warehouse, color: 'text-emerald-400', bg: 'bg-emerald-400/10' },
+    { title: 'PG & Co-living', prompt: 'Looking for a double sharing PG in Koramangala for boys', icon: Warehouse, color: 'text-purple-400', bg: 'bg-purple-400/10' },
     { title: 'Affordable Homes', prompt: 'Looking for a 1BHK in BTM Layout under 15k', icon: Home, color: 'text-orange-400', bg: 'bg-orange-400/10' }
   ];
 
@@ -60,6 +60,11 @@ export default function Page() {
       });
       const data = await response.json();
       
+      const sessionData = data?.data || {};
+      const dynamicLabel = sessionData?.persona === 'pg' 
+        ? `${sessionData?.size_bhk || 0} Sharing in ${sessionData?.location || 'Bengaluru'}`
+        : `${sessionData?.size_bhk || 0} BHK in ${sessionData?.location || 'Bengaluru'}`;
+
       if (data?.response) {
         setMessages(prev => [...prev, { role: 'assistant', content: data.response }]);
         
@@ -67,7 +72,7 @@ export default function Page() {
           if(data.family_hubs) setFamilyHubs(data.family_hubs);
 
           const newCapsule = {
-            label: `${data.data.size_bhk} BHK in ${data.data.location}`,
+            label: dynamicLabel,
             properties: data.properties,
             familyHubs: data.family_hubs || [],
             snapshot: data.data 
@@ -144,6 +149,24 @@ export default function Page() {
                   }`}>
                     {m.content}
                   </div>
+
+                  {/* ✅ ADD THIS BLOCK HERE: Quick Action Buttons for Persona Choice */}
+                  {m.role === 'assistant' && m.content.includes("looking for a Home/Apartment") && (
+                    <div className="flex gap-3 mt-4 animate-in fade-in slide-in-from-left duration-500">
+                      <button 
+                        onClick={() => handleSend("I'm looking for a Home/Apartment")}
+                        className="px-6 py-3 bg-blue-600 text-white rounded-2xl text-[10px] font-black uppercase tracking-widest shadow-lg hover:bg-blue-500 transition-all flex items-center gap-2"
+                      >
+                        <Home size={14}/> Home / Apartment
+                      </button>
+                      <button 
+                        onClick={() => handleSend("I'm looking for a PG/Co-living")}
+                        className="px-6 py-3 bg-purple-600 text-white rounded-2xl text-[10px] font-black uppercase tracking-widest shadow-lg hover:bg-purple-500 transition-all flex items-center gap-2"
+                      >
+                        <Warehouse size={14}/> PG / Co-living
+                      </button>
+                    </div>
+                  )}
 
                   {m.role === 'assistant' && (m.content.includes("found") || m.content.includes("matches")) && (
                     <div className="flex flex-wrap gap-2 mt-4 px-2">
@@ -261,11 +284,26 @@ const PropertyCard = ({ prop, theme }) => {
         </h4>
         <div className="flex flex-wrap gap-2 mb-6">
           <div className="bg-blue-500/10 text-blue-500 text-[10px] font-bold px-3 py-1.5 rounded-xl flex items-center gap-1.5">
-            <BedDouble size={12}/> {prop.size_bhk} BHK
+            <BedDouble size={12}/>
+            {prop.property_type === 'PG' || prop.property_type === 'Hostel' || prop.property_type === 'Co-living' 
+              ? `${prop.size_bhk} Sharing` 
+              : `${prop.size_bhk} BHK`}
           </div>
-          <div className="bg-emerald-500/10 text-emerald-500 text-[10px] font-bold px-3 py-1.5 rounded-xl flex items-center gap-1.5">
-            <TrendingUp size={12}/> {prop.total_sqft} Sqft
-          </div>
+          {/* PG Specific: Food Status */}
+          {prop.food_included !== undefined && (
+            <div className={`text-[10px] font-bold px-3 py-1.5 rounded-xl flex items-center gap-1.5 ${prop.food_included ? 'bg-emerald-500/10 text-emerald-500' : 'bg-zinc-500/10 text-zinc-500'}`}>
+              <CheckCircle2 size={12}/> {prop.food_included ? "Food Inc." : "No Food"}
+            </div>
+          )}
+
+          {/* PG Specific: Gender Preference */}
+          {prop.preferred_tenants && (
+            <div className="bg-purple-500/10 text-purple-500 text-[10px] font-bold px-3 py-1.5 rounded-xl">
+              {prop.preferred_tenants} Only
+            </div>
+          )}
+
+          {/* Standard Rent/Deposit */}
           <div className="bg-orange-500/10 text-orange-500 text-[10px] font-bold px-3 py-1.5 rounded-xl">
              Deposit: {prop.formatted_deposit || "₹" + prop.legal_security_deposit}
           </div>
