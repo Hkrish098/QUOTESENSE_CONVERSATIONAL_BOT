@@ -32,7 +32,7 @@ REQUIRED — extract these if mentioned in the latest message:
   - gender_preference  : "Boys", "Girls", or "Unisex"
   - rent_price_inr_per_month : budget as raw text ("10k", "8000", "1.5 lakhs")
   - location           : Bengaluru area name
-  - nearby_hub         : college, tech park, or office name if mentioned
+  - nearby_hub         : ONLY extract if the user mentions a name that closely matches one of these known values: "100ft Road", "27th Main Road", "BTM 2nd Stage", "Biocon", "CMH Road", "Central Mall", "Christ University", "Columbia Asia Hospital", "Decathlon Sarjapur", "ESI Hospital", "Eco World", "Elements Mall", "Embassy Tech Village", "GR Tech Park", "HSR BDA Complex", "Hebbal Flyover", "IIIT Bangalore", "IIM Bangalore", "IISc Bangalore", "ITPL", "Infosys Campus", "Innovative Multiplex", "Iskcon Temple", "Jain University", "Jayanagar 4th Block", "Jyoti Nivas College", "Kalamandir", "Koramangala 80ft Road", "Lumbini Gardens", "MS Ramaiah Institute", "MVJ College", "Manyata Tech Park", "NIFT Bangalore", "Orion Mall", "Oxford College", "PES University (EC Campus)", "Prestige Tech Park", "RGA Tech Park", "RMZ Ecospace", "RV Road", "Sigma Soft Tech Park", "Silk Board", "St. Johns Hospital", "Tata Consultancy Services", "Tech Mahindra", "Toit Brewery", "Udupi Garden", "Wipro Gate 1", "Wipro Sarjapur", "World Trade Center", "Yeshwanthpur Metro". If the user mentions a landmark NOT in this list (e.g. "Nexus Mall", "Forum Mall"), set nearby_hub to null — do NOT guess or invent a hub name
   - food_included      : "true" only if food/meals/mess explicitly mentioned
   - has_washing_machine: "true" only if laundry/washing machine explicitly mentioned
   - has_gym            : "true" only if gym/fitness explicitly mentioned
@@ -47,8 +47,11 @@ REQUIRED — extract these if mentioned in the latest message:
   - size_bhk           : bedrooms ("1", "2", "3", "4")
   - rent_price_inr_per_month : budget as raw text
   - location           : Bengaluru area name
-  - marital_status     : "Married" if wife/husband/family/partner; "Single" if alone/bachelor/solo
   - family_hubs        : JSON array of workplace/school areas e.g. ["HSR Layout", "Whitefield"]
+
+  marital_status — DO NOT INFER. Only extract if user uses these exact words:
+    "married", "wife", "husband", "spouse", "couple", "single", "bachelor"
+    If none of these appear in the latest message → set marital_status to null.
 
 ⛔ NEVER extract for HOME: Sharing, gender_preference, nearby_hub, food_included, has_wifi, has_washing_machine"""
 

@@ -29,7 +29,7 @@ from ai_tools import get_extraction_prompt, amenity_explicitly_mentioned
 from schemas import RentalExtractionMonitor
 from recommender import get_smart_suggestions
 from geospatial import get_coordinates
-from transport_info import format_transport_for_area
+from transport_info import format_transport_for_area, get_transport_summary, reverse_geocode_area
 from utils import safe_int, coerce_bool
 
 load_dotenv()
@@ -63,6 +63,72 @@ BOOL_AMENITY_FIELDS = frozenset({
 })
 INT_AMENITY_FIELDS = frozenset({"bath", "balcony"})
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PG Hub Registry — GROUND TRUTH from database.
+# Keys = normalised location names (must match DB `location` column exactly).
+# Values = list of `nearby_hub` values that exist in the DB for that location.
+# Used to: (1) show users real options, (2) validate extracted hub names,
+#           (3) skip the nearby_hub filter if user gave a non-matching name.
+# ─────────────────────────────────────────────────────────────────────────────
+PG_LOCATION_HUBS: dict[str, list[str]] = {
+    "BTM Layout":             ["BTM 2nd Stage", "IIM Bangalore", "Silk Board", "Udupi Garden"],
+    "Bellandur":              ["Central Mall", "Eco World", "Embassy Tech Village", "RMZ Ecospace"],
+    "Electronic City Phase 1":["IIIT Bangalore", "Infosys Campus", "PES University (EC Campus)", "Wipro Gate 1"],
+    "Electronic City Phase 2":["Biocon", "Tata Consultancy Services", "Tech Mahindra"],
+    "HSR Layout":             ["27th Main Road", "HSR BDA Complex", "NIFT Bangalore", "Oxford College"],
+    "Hebbal":                 ["Columbia Asia Hospital", "Hebbal Flyover", "Manyata Tech Park"],
+    "Indiranagar":            ["100ft Road", "CMH Road", "ESI Hospital", "Toit Brewery"],
+    "Jayanagar":              ["Jain University", "Jayanagar 4th Block", "RV Road"],
+    "Koramangala":            ["Christ University", "Jyoti Nivas College", "Koramangala 80ft Road", "St. Johns Hospital"],
+    "Marathahalli":           ["Innovative Multiplex", "Kalamandir", "Prestige Tech Park"],
+    "Mathikere":              ["IISc Bangalore", "MS Ramaiah Institute", "Yeshwanthpur Metro"],
+    "Nagavara":               ["Elements Mall", "Lumbini Gardens", "Manyata Tech Park"],
+    "Rajajinagar":            ["Iskcon Temple", "Orion Mall", "World Trade Center"],
+    "Sarjapur Road":          ["Decathlon Sarjapur", "RGA Tech Park", "Wipro Sarjapur"],
+    "Whitefield":             ["GR Tech Park", "ITPL", "MVJ College", "Sigma Soft Tech Park"],
+}
+
+# Flat set of ALL valid hub names (for fast lookup)
+ALL_PG_HUBS: frozenset[str] = frozenset(
+    hub for hubs in PG_LOCATION_HUBS.values() for hub in hubs
+)
+
+
+def _get_pg_hubs_for_location(location: str) -> list[str]:
+    """Returns known nearby_hub options for a given PG location. Case-insensitive."""
+    loc_lower = location.strip().lower()
+    for key, hubs in PG_LOCATION_HUBS.items():
+        if key.lower() == loc_lower or loc_lower in key.lower():
+            return hubs
+    return []
+
+
+def _validate_pg_hub(hub_name: str, location: str = "") -> str | None:
+    """
+    Returns the exact DB hub name if hub_name matches a known hub (exact or partial),
+    otherwise returns None.
+    Optionally restricts to hubs available in a specific location.
+    """
+    if not hub_name:
+        return None
+    hub_lower = hub_name.strip().lower()
+    # First try exact match in all hubs
+    for known in ALL_PG_HUBS:
+        if known.lower() == hub_lower:
+            return known
+    # Partial match — hub_lower is a substring of a known hub (e.g. "80ft road" → "Koramangala 80ft Road")
+    for known in ALL_PG_HUBS:
+        if hub_lower in known.lower() or known.lower() in hub_lower:
+            # If location given, restrict to that location's hubs
+            if location:
+                loc_hubs = _get_pg_hubs_for_location(location)
+                if known in loc_hubs:
+                    return known
+            else:
+                return known
+    return None
+
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 class ChatRequest(BaseModel):
@@ -76,11 +142,18 @@ def _empty_session() -> dict:
         "persona": None, "size_bhk": 0, "total_sqft": 0, "furnishing": "",
         "marital_status": "", "family_hubs": [], "structure": "",
         "Sharing": 0, "gender_preference": "", "nearby_hub": "",
+        "pg_hub_state": None,   # None | "offered" | "confirmed"
         "bath": 0, "balcony": 0,
         "two_wheeler_parking": False, "four_wheeler_parking": False,
         "gym_nearby": False, "food_included": False,
         "has_wifi": False, "has_washing_machine": False,
         "history": [],
+        # Midpoint state machine
+        "midpoint_state": None,      # None | "offered" | "confirmed"
+        "midpoint_lat": None,
+        "midpoint_lng": None,
+        "midpoint_area": "",         # reverse-geocoded area name
+        "family_coords_cache": [],   # [{name, lat, lng}, ...]
     }
 
 
@@ -97,69 +170,74 @@ def _detect_persona(msg: str) -> Optional[str]:
 # FIX [1]: Dashboard — no border, plain list, BHK hidden for PG persona
 # ─────────────────────────────────────────────────────────────────────────────
 def _build_dashboard(session: dict) -> str:
+    """Server-side requirements dashboard. Clean numbered list, minimal emoji."""
     persona = session.get("persona")
     lines = []
+    n = 1
 
     if session.get("location"):
-        lines.append(f"📍 Location: {session['location']}")
+        lines.append(f"  {n}. Location       : {session['location']}")
+        n += 1
 
-    # FIX [1]: For PG, NEVER show BHK — show Sharing only.
-    #          For Home, NEVER show Sharing — show BHK only.
     if persona == "pg":
         sharing = safe_int(session.get("Sharing"), 0)
         if sharing > 0:
-            label = {1: "Single", 2: "Double", 3: "Triple", 4: "Four"}.get(sharing, f"{sharing}")
-            lines.append(f"🤝 Sharing: {label} Sharing")
+            label = {1: "Single", 2: "Double", 3: "Triple", 4: "Four"}.get(sharing, str(sharing))
+            lines.append(f"  {n}. Sharing        : {label}")
+            n += 1
         if session.get("gender_preference"):
-            lines.append(f"🚻 Gender: {session['gender_preference']} PG")
+            lines.append(f"  {n}. Type           : {session['gender_preference']} PG")
+            n += 1
     else:
         bhk = safe_int(session.get("size_bhk"), 0)
         if bhk > 0:
-            lines.append(f"🛏️  BHK: {bhk} BHK")
+            lines.append(f"  {n}. BHK            : {bhk} BHK")
+            n += 1
 
     budget = safe_int(session.get("rent_price_inr_per_month"), 0)
     if budget > 0:
-        lines.append(f"💰 Budget: ₹{budget:,}/month")
+        lines.append(f"  {n}. Budget         : ₹{budget:,}/month")
+        n += 1
 
     if persona != "pg":
         sqft = safe_int(session.get("total_sqft"), 0)
         if sqft > 0:
-            lines.append(f"📐 Area: {sqft} sqft")
-
+            lines.append(f"  {n}. Area           : {sqft} sqft")
+            n += 1
         if session.get("furnishing"):
-            lines.append(f"🛋️  Furnishing: {session['furnishing']}")
-
+            lines.append(f"  {n}. Furnishing     : {session['furnishing']}")
+            n += 1
         if session.get("marital_status"):
-            lines.append(f"👫 Status: {session['marital_status']}")
-
+            lines.append(f"  {n}. Status         : {session['marital_status']}")
+            n += 1
         hubs = session.get("family_hubs", [])
         if hubs:
-            lines.append(f"🏢 Work/School Hubs: {', '.join(hubs)}")
-
+            lines.append(f"  {n}. Work Hubs      : {', '.join(hubs)}")
+            n += 1
         if safe_int(session.get("bath"), 0) > 0:
-            lines.append(f"🚿 Bathrooms: {session['bath']}")
-
+            lines.append(f"  {n}. Bathrooms      : {session['bath']}")
+            n += 1
         if safe_int(session.get("balcony"), 0) > 0:
-            lines.append(f"🌿 Balconies: {session['balcony']}")
+            lines.append(f"  {n}. Balcony        : Yes")
+            n += 1
 
-    # PG-specific info
     if persona == "pg" and session.get("nearby_hub"):
-        lines.append(f"🏫 Near: {session['nearby_hub']}")
+        lines.append(f"  {n}. Near           : {session['nearby_hub']}")
+        n += 1
 
-    # Amenities (relevant to both)
-    amenity_icons = []
-    if session.get("two_wheeler_parking"):   amenity_icons.append("🏍️ Bike Parking")
-    if session.get("four_wheeler_parking"):  amenity_icons.append("🚗 Car Parking")
-    if session.get("gym_nearby"):            amenity_icons.append("💪 Gym")
-    if session.get("food_included"):         amenity_icons.append("🍱 Food Included")
-    if session.get("has_washing_machine"):   amenity_icons.append("🫧 Washing Machine")
-    if amenity_icons:
-        lines.append(f"✅ Amenities: {', '.join(amenity_icons)}")
+    amenities = []
+    if session.get("two_wheeler_parking"):   amenities.append("Bike Parking")
+    if session.get("four_wheeler_parking"):  amenities.append("Car Parking")
+    if session.get("gym_nearby"):            amenities.append("Gym Nearby")
+    if session.get("food_included"):         amenities.append("Food Included")
+    if session.get("has_washing_machine"):   amenities.append("Washing Machine")
+    if amenities:
+        lines.append(f"  {n}. Amenities      : {', '.join(amenities)}")
 
     if not lines:
         return ""
 
-    return "📋 Your Requirements So Far:\n" + "\n".join(f"  {l}" for l in lines)
+    return "— Your Search Criteria —\n" + "\n".join(lines)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -290,8 +368,25 @@ def _merge_extracted_into_session(raw: dict, session: dict, current_msg: str) ->
                 if any(kw in current_msg.lower() for kw in _sharing_kw):
                     session["Sharing"] = val
                     session["size_bhk"] = val  # mirror for DB query only
+        elif key == "marital_status":
+            # Guard: only write marital_status if user explicitly stated it.
+            # Prevents SLM inferring "Single" from "I want to rent a house".
+            _married_kw = ["married", "wife", "husband", "spouse", "partner", "couple"]
+            _single_kw  = ["single", "bachelor", "alone", "solo", "by myself", "just me"]
+            msg_lower   = current_msg.lower()
+            if any(kw in msg_lower for kw in _married_kw + _single_kw):
+                session["marital_status"] = val
+        elif key == "location":
+            # Guard: once family_hubs are confirmed (2+ entries), lock the location.
+            # Prevents extractor overwriting location with midpoint area names.
+            if len(session.get("family_hubs", [])) < 2:
+                session["location"] = val
         elif key == "nearby_hub":
-            session["nearby_hub"] = val
+            # Guard: only store hub if it matches a real DB value
+            validated_hub = _validate_pg_hub(str(val), session.get("location", ""))
+            if validated_hub:
+                session["nearby_hub"] = validated_hub
+            # else: discard — don't store free-text that won't match DB
         elif key in session:
             session[key] = val
         else:
@@ -386,6 +481,218 @@ def _repair_session_from_history(session: dict) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Midpoint area choice helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _hub_matches(hub_name: str, user_msg_lower: str) -> bool:
+    """Robust hub name matcher — handles abbreviations, typos, partial names."""
+    from location_areas import normalise_area
+    hub_lower = hub_name.lower()
+    if hub_lower in user_msg_lower:
+        return True
+    skip = {"the", "and", "near", "area", "road", "main", "cross", "phase", "layout", "city"}
+    hub_words = [w for w in hub_lower.split() if len(w) >= 3 and w not in skip]
+    msg_words  = set(user_msg_lower.split())
+    if any(w in msg_words for w in hub_words):
+        return True
+    for word in user_msg_lower.split():
+        if len(word) >= 3:
+            try:
+                normalised = normalise_area(word).lower()
+                if normalised == hub_lower or hub_lower.startswith(normalised):
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+def _detect_area_choice(msg: str, session: dict) -> str:
+    """
+    Detects which area option the user chose from the midpoint menu.
+    Returns: "midpoint" | "hub_0" | "hub_1" | "hub_2" | "all"
+
+    Order of priority:
+      1. Numbered option (2, 3...) or hub name match → hub_N
+      2. "all"/"both" keywords or last option number → all
+      3. "1"/"first"/midpoint name/"midpoint" → midpoint
+      4. Fallback → midpoint
+    """
+    import re as _re
+    lower = msg.strip().lower()
+    family_coords = session.get("family_coords_cache", [])
+    midpoint_area = (session.get("midpoint_area") or "").lower()
+
+    # 1. Hub check FIRST (highest priority — prevents "all" in "marathahalli" false-positive)
+    for i, c in enumerate(family_coords[:3]):
+        num = str(i + 2)
+        if lower.strip() in (num, f"{num}.", f"option {num}"):
+            return f"hub_{i}"
+        if _hub_matches(c["name"], lower):
+            return f"hub_{i}"
+
+    # 2. "all"/"both" or last numbered option
+    last_num = str(len(family_coords) + 2)
+    if lower.strip() in (last_num, f"{last_num}.", f"option {last_num}"):
+        return "all"
+    all_kw = ["show all", "all areas", "all three", "every area", "both areas"]
+    if any(k in lower for k in all_kw) or _re.search(r"\ball\b|\bboth\b|\bevery\b", lower):
+        return "all"
+
+    # 3. Midpoint
+    if lower.strip() in ("1", "1.", "first", "option 1", "midpoint") or \
+       (midpoint_area and midpoint_area in lower) or "midpoint" in lower:
+        return "midpoint"
+
+    return "midpoint"
+
+
+
+def _resolve_search_areas(choice: str, session: dict, family_coords: list) -> list[dict]:
+    """
+    Converts a choice string into a list of area dicts for DB querying.
+    Each dict: {type: "midpoint"|"hub", name, label, lat, lng}
+    """
+    midpoint_lat  = session.get("midpoint_lat")
+    midpoint_lng  = session.get("midpoint_lng")
+    midpoint_area = session.get("midpoint_area", "Midpoint Area")
+
+    midpoint_entry = {
+        "type": "midpoint", "name": midpoint_area,
+        "label": f"{midpoint_area} (Midpoint ⭐)",
+        "lat": midpoint_lat, "lng": midpoint_lng,
+    }
+
+    if choice == "midpoint":
+        return [midpoint_entry]
+
+    if choice == "all":
+        areas = [midpoint_entry]
+        for c in family_coords:
+            areas.append({
+                "type": "hub", "name": c["name"],
+                "label": c["name"],
+                "lat": c["lat"], "lng": c["lng"],
+            })
+        return areas
+
+    # hub_0, hub_1, hub_2
+    try:
+        idx = int(choice.split("_")[1])
+        c = family_coords[idx]
+        return [{
+            "type": "hub", "name": c["name"],
+            "label": c["name"],
+            "lat": c["lat"], "lng": c["lng"],
+        }]
+    except (IndexError, ValueError):
+        return [midpoint_entry]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Session title + action buttons
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _generate_session_title(session: dict) -> str:
+    """
+    Auto-generates a sidebar session title like the Tatva.Build app.
+    Examples:
+      "1 BHK in Koramangala — ₹20k"
+      "Double Sharing Boys PG · HSR Layout"
+      "3 BHK Married · Whitefield–Marathahalli midpoint"
+    """
+    persona = session.get("persona")
+    parts   = []
+
+    if persona == "pg":
+        sharing = safe_int(session.get("Sharing"), 0)
+        gender  = session.get("gender_preference", "")
+        label   = {1: "Single", 2: "Double", 3: "Triple", 4: "Four"}.get(sharing, "")
+        if label and gender:
+            parts.append(f"{label} Sharing {gender} PG")
+        elif label:
+            parts.append(f"{label} Sharing PG")
+        else:
+            parts.append("PG")
+    else:
+        bhk = safe_int(session.get("size_bhk"), 0)
+        if bhk:
+            parts.append(f"{bhk} BHK")
+        else:
+            parts.append("Home")
+
+    # Location / midpoint
+    midpoint_area = session.get("midpoint_area", "")
+    hubs          = session.get("family_hubs", [])
+    location      = session.get("location", "")
+
+    if midpoint_area and len(hubs) >= 2:
+        hub_short = "–".join(h.split()[0] for h in hubs[:2])
+        parts.append(f"near {midpoint_area} ({hub_short} midpoint)")
+    elif location:
+        parts.append(f"in {location}")
+
+    # Budget
+    budget = safe_int(session.get("rent_price_inr_per_month"), 0)
+    if budget:
+        if budget >= 100_000:
+            b_str = f"₹{budget//100000}L"
+        elif budget >= 1000:
+            b_str = f"₹{budget//1000}k"
+        else:
+            b_str = f"₹{budget}"
+        parts.append(b_str)
+
+    return " · ".join(parts) if parts else "New Search"
+
+
+def _build_actions(status: str, session: dict) -> list[dict]:
+    """
+    Returns a list of action button definitions for the frontend to render.
+    Each button: {id, label, style}   style: "primary" | "secondary" | "ghost"
+
+    Status values:
+      "complete"        → listings shown
+      "midpoint_choice" → midpoint menu shown
+      "incomplete"      → still collecting info
+    """
+    persona = session.get("persona")
+    actions = []
+
+    if status == "complete":
+        actions += [
+            {"id": "refine_search", "label": "Refine Search",   "style": "secondary"},
+            {"id": "change_area",   "label": "Change Area",     "style": "secondary"},
+            {"id": "new_search",    "label": "New Search",      "style": "ghost"},
+        ]
+        if len(session.get("family_hubs", [])) >= 2:
+            actions.insert(0, {
+                "id": "show_other_areas", "label": "Try Other Areas", "style": "primary"
+            })
+
+    elif status == "midpoint_choice":
+        hubs = session.get("family_hubs", [])
+        actions.append({"id": "choose_midpoint", "label": "Midpoint (Recommended)", "style": "primary"})
+        for i, hub in enumerate(hubs[:3]):
+            actions.append({
+                "id": f"choose_hub_{i}",
+                "label": f"Near {hub}",
+                "style": "secondary",
+            })
+        actions.append({"id": "choose_all", "label": "Show All Areas", "style": "ghost"})
+
+    elif status == "incomplete":
+        # Only show if user seems close to done (has location + budget)
+        has_basics = (
+            session.get("rent_price_inr_per_month", 0) > 0 and
+            (session.get("location") or len(session.get("family_hubs", [])) >= 1)
+        )
+        if has_basics:
+            actions.append({"id": "show_me", "label": "Show Listings", "style": "primary"})
+
+    return actions
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Chat endpoint
 # ─────────────────────────────────────────────────────────────────────────────
 @app.post("/chat")
@@ -457,11 +764,31 @@ async def chat_handler(request: ChatRequest):
             if v not in (0, "", None, [], False) and k != "history"
         )
 
+        persona = session.get("persona")
+
         system_prompt_fn = (
             get_pg_system_prompt if session.get("persona") == "pg" else get_system_prompt
         )
         system_msg = system_prompt_fn(session, [])
         system_msg += f"\n\n### GROUND TRUTH — DO NOT RE-ASK:\n{known_summary}"
+
+        # For PG: inject the actual available nearby_hubs for the confirmed location
+        if persona == "pg" and session.get("location"):
+            pg_hubs = _get_pg_hubs_for_location(session["location"])
+            if pg_hubs and not session.get("nearby_hub"):
+                hub_list = ", ".join(f"\"{h}\"" for h in pg_hubs)
+                system_msg += (
+                    f"\n\n### PG HUB OPTIONS FOR {session['location'].upper()} (use these EXACT names):"
+                    f"\n{hub_list}"
+                    f"\nWhen asking about nearby landmark/office/college, present ONLY these options."
+                    f" Do NOT accept or store any other hub name the user mentions."
+                    f" Format as: 'Which is closest to you — {', '.join(pg_hubs[:3])}?'"
+                )
+            elif session.get("nearby_hub"):
+                system_msg += (
+                    f"\n\n### PG HUB CONFIRMED: {session['nearby_hub']}"
+                    f"\nDo NOT ask about nearby hub again."
+                )
 
         if len(hubs) >= 2:
             system_msg += (
@@ -471,11 +798,12 @@ async def chat_handler(request: ChatRequest):
 
         system_msg += (
             "\n\n### OUTPUT RULES (STRICT):"
-            "\n1. Do NOT print any requirements list, dashboard, or header."
-            "\n2. Do NOT print 'Your Tatva PG Selections' or any similar header."
-            "\n3. Start directly with the conversational message."
-            "\n4. Ask EXACTLY 2 questions bundled in one reply (follow the phase strategy)."
-            "\n5. When ready to show listings, say: 'Ready to see your matches? Just say show me! 🏠🔥'"
+            "\n1. No emojis. Plain text only."
+            "\n2. Do NOT print any requirements list, dashboard, or header of any kind."
+            "\n3. Start directly with the conversational message — no preamble."
+            "\n4. Ask EXACTLY 2 questions per reply (follow the phase strategy)."
+            "\n5. No filler phrases: 'Love it!', 'Awesome!', 'Great choice!' are banned."
+            "\n6. When ready to show listings, say exactly: \"Ready to search? Say show me.\""
         )
 
         consultant_messages = [{"role": "system", "content": system_msg}]
@@ -509,7 +837,7 @@ async def chat_handler(request: ChatRequest):
         target_table = "PG_Listings" if persona == "pg" else "properties"
 
         if persona == "pg":
-            essentials = ["rent_price_inr_per_month", "Sharing", "gender_preference"]
+            essentials = ["Sharing", "gender_preference", "location"]  # budget optional for PG
         else:
             essentials = ["rent_price_inr_per_month", "size_bhk"]
             if len(hubs) < 2:
@@ -520,7 +848,7 @@ async def chat_handler(request: ChatRequest):
         )
         user_wants_show = bool(
             re.search(r"\b(show|list|search|find|ok show|show me)\b", msg.lower())
-        )
+        ) or session.get("midpoint_state") in ("offered", "confirmed")  # user replying to/after midpoint menu
 
         if user_wants_show and has_enough_data:
             query = supabase.table(target_table).select("*")
@@ -553,70 +881,177 @@ async def chat_handler(request: ChatRequest):
                 if session.get("gym_nearby"):
                     query = query.eq("has_gym", True)
 
-                # Nearby hub
-                if session.get("nearby_hub"):
-                    query = query.ilike("nearby_hub", f"%{session['nearby_hub']}%")
+                # Nearby hub — only apply if it's a validated DB value
+                hub = session.get("nearby_hub", "")
+                if hub and hub in ALL_PG_HUBS:
+                    query = query.eq("nearby_hub", hub)
 
             # ── Home-specific DB filters ───────────────────────────────────
             else:
-                family_coords = []
-                for hub in hubs:
-                    try:
-                        c = get_coordinates(hub)
-                        if c and c.get("lat") and c.get("lng"):
-                            family_coords.append({"name": hub, **c})
-                    except Exception:
-                        print(f"⚠️ Geocoding failed: {hub}")
+                # Geocode hubs (use cache if already done)
+                family_coords = session.get("family_coords_cache") or []
+                if not family_coords:
+                    for hub in hubs:
+                        try:
+                            c = get_coordinates(hub)
+                            if c and c.get("lat") and c.get("lng"):
+                                family_coords.append({"name": hub, **c})
+                        except Exception:
+                            print(f"⚠️ Geocoding failed: {hub}")
+                    session["family_coords_cache"] = family_coords
 
-                using_midpoint = False
-                midpoint_lat = midpoint_lng = None
-                recommendation_text = ""
-                transport_text = ""
+                # ── MIDPOINT STATE: "confirmed" → user wants a different area ─
+                # Re-detect area choice and search directly (skip the menu).
+                if session.get("midpoint_state") == "confirmed":
+                    session["midpoint_state"] = "offered"  # allow re-resolution
 
-                if len(family_coords) >= 2:
-                    try:
-                        midpoint_lat = sum(c["lat"] for c in family_coords) / len(family_coords)
-                        midpoint_lng = sum(c["lng"] for c in family_coords) / len(family_coords)
-                        hub_names = ", ".join(c["name"] for c in family_coords)
-                        query = (
-                            query
-                            .gte("latitude",  midpoint_lat - 0.04).lte("latitude",  midpoint_lat + 0.04)
-                            .gte("longitude", midpoint_lng - 0.04).lte("longitude", midpoint_lng + 0.04)
-                        )
-                        recommendation_text = (
-                            f"\n\n💡 **Tatva Midpoint Choice:**\n"
-                            f"Optimal midpoint between **{hub_names}** — "
-                            f"saves everyone daily commute time and transport cost! 🚀"
-                        )
-                        using_midpoint = True
-                        if GOOGLE_API_KEY:
-                            transport_text = format_transport_for_area(
-                                "Midpoint Area", midpoint_lat, midpoint_lng, GOOGLE_API_KEY
+                # ── MIDPOINT STATE: "offered" → user is choosing area ──────
+                if session.get("midpoint_state") == "offered":
+                    choice = _detect_area_choice(msg, session)
+                    areas_to_search = _resolve_search_areas(choice, session, family_coords)
+
+                    all_results = []
+                    transport_blocks = []
+                    rec_text = ""
+
+                    for area in areas_to_search:
+                        area_query = supabase.table(target_table).select("*")
+                        if area["type"] == "midpoint":
+                            lat, lng = area["lat"], area["lng"]
+                            area_query = (
+                                area_query
+                                .gte("latitude",  lat - 0.04).lte("latitude",  lat + 0.04)
+                                .gte("longitude", lng - 0.04).lte("longitude", lng + 0.04)
                             )
-                    except Exception:
-                        traceback.print_exc()
+                        else:
+                            area_query = area_query.ilike("location", f"%{area['name']}%")
 
-                if not using_midpoint and session.get("location"):
-                    query = query.ilike("location", f"%{session['location']}%")
+                        raw_size = session.get("size_bhk")
+                        search_size = safe_int(raw_size) if raw_size and raw_size != 0 else 1
+                        area_query = area_query.eq("size_bhk", search_size)
 
-                raw_size = session.get("size_bhk")
-                search_size = safe_int(raw_size) if raw_size and raw_size != 0 else 1
-                query = query.eq("size_bhk", search_size)
+                        budget = safe_int(session.get("rent_price_inr_per_month"), 0)
+                        if budget > 0:
+                            area_query = area_query.lte("rent_price_inr_per_month", budget)
 
-                budget = safe_int(session.get("rent_price_inr_per_month"), 0)
-                if budget > 0:
-                    query = query.lte("rent_price_inr_per_month", budget)
+                        try:
+                            r = area_query.limit(10).execute()
+                            all_results.extend(r.data or [])
+                        except Exception:
+                            traceback.print_exc()
 
-            # ── Execute ────────────────────────────────────────────────────
-            try:
-                result   = query.limit(15).execute()
-                res_data = result.data
-            except Exception as db_err:
-                traceback.print_exc()
-                return JSONResponse(status_code=500, content={
-                    "response": "Database connection error. Please try again.",
-                    "status": "error", "debug": str(db_err),
-                })
+                        # Transport info for each chosen area
+                        if GOOGLE_API_KEY and area.get("lat") and area.get("lng"):
+                            t = format_transport_for_area(area["label"], area["lat"], area["lng"], GOOGLE_API_KEY)
+                            if t:
+                                transport_blocks.append(t)
+
+                    session["midpoint_state"] = "confirmed"
+                    res_data = all_results
+
+                    if areas_to_search:
+                        area_labels = ", ".join(a["label"] for a in areas_to_search)
+                        rec_text = f"\n\nSearching near: {area_labels}"
+                    transport_text = "\n".join(transport_blocks)
+
+                    # Fall through to shared format + return below
+                    # (set using_midpoint so we skip the ilike fallback)
+                    using_midpoint = True
+                    recommendation_text = rec_text
+
+                # ── MIDPOINT STATE: None → first "show me", calculate midpoint ─
+                elif len(family_coords) >= 2:
+                    midpoint_lat = sum(c["lat"] for c in family_coords) / len(family_coords)
+                    midpoint_lng = sum(c["lng"] for c in family_coords) / len(family_coords)
+                    hub_names    = " and ".join(c["name"] for c in family_coords)
+
+                    # Reverse-geocode midpoint to a readable area name
+                    midpoint_area = (
+                        reverse_geocode_area(midpoint_lat, midpoint_lng, GOOGLE_API_KEY)
+                        if GOOGLE_API_KEY else "the midpoint area"
+                    )
+
+                    # Transport info for midpoint
+                    transport_info = {}
+                    transport_text = ""
+                    if GOOGLE_API_KEY:
+                        transport_info = get_transport_summary(midpoint_lat, midpoint_lng, GOOGLE_API_KEY)
+                        transport_text = transport_info.get("transport_text", "")
+
+                    # Store midpoint in session for next turn
+                    session["midpoint_state"]      = "offered"
+                    session["midpoint_lat"]         = midpoint_lat
+                    session["midpoint_lng"]         = midpoint_lng
+                    session["midpoint_area"]        = midpoint_area
+                    session["family_coords_cache"]  = family_coords
+
+                    # Build the option menu
+                    hub_options = []
+                    role_labels = ["your", "partner's", "hub 3's"]
+                    for _i, _c in enumerate(family_coords[:3]):
+                        _role = role_labels[_i] if _i < len(role_labels) else ""
+                        hub_options.append(f"  {_i+2}. Near {_c['name']} ({_role} office)")
+                    hub_options = "\n".join(hub_options)
+                    transport_lines = f"\n  {transport_text.strip()}" if transport_text else ""
+
+                    all_opt_num = len(family_coords) + 2
+                    midpoint_msg = (
+                        f"{dashboard}\n\n"
+                        f"**Commute Midpoint Calculated**\n\n"
+                        f"  Midpoint area : {midpoint_area}\n"
+                        f"  Between       : {hub_names}"
+                        f"{transport_lines}\n\n"
+                        f"Where would you like to search?\n\n"
+                        f"  1. {midpoint_area} (midpoint — recommended)\n"
+                        f"{hub_options}\n"
+                        f"  {all_opt_num}. Show listings from all areas\n\n"
+                        "Reply with the number or area name."
+                    )
+                    session["history"] += [
+                        {"role": "user",      "content": msg},
+                        {"role": "assistant", "content": midpoint_msg},
+                    ]
+                    return JSONResponse(content={
+                        "response":      midpoint_msg,
+                        "status":        "midpoint_choice",
+                        "actions":       _build_actions("midpoint_choice", session),
+                        "session_title": _generate_session_title(session),
+                        "data":          session,
+                    })
+
+                else:
+                    # Single hub or no hubs — direct location search
+                    using_midpoint = False
+                    recommendation_text = ""
+                    transport_text = ""
+                    res_data = None  # will be fetched below
+
+                    if session.get("location"):
+                        query = query.ilike("location", f"%{session['location']}%")
+                    elif family_coords:
+                        query = query.ilike("location", f"%{family_coords[0]['name']}%")
+
+                    raw_size = session.get("size_bhk")
+                    search_size = safe_int(raw_size) if raw_size and raw_size != 0 else 1
+                    query = query.eq("size_bhk", search_size)
+
+                    budget = safe_int(session.get("rent_price_inr_per_month"), 0)
+                    if budget > 0:
+                        query = query.lte("rent_price_inr_per_month", budget)
+
+                        # ── Execute (skip if state machine already fetched res_data) ──
+            if persona != "pg" and session.get("midpoint_state") == "confirmed":
+                pass  # res_data already populated by state machine above
+            else:
+                try:
+                    result   = query.limit(15).execute()
+                    res_data = result.data
+                except Exception as db_err:
+                    traceback.print_exc()
+                    return JSONResponse(status_code=500, content={
+                        "response": "Database connection error. Please try again.",
+                        "status": "error", "debug": str(db_err),
+                    })
 
             if not res_data:
                 try:
@@ -649,14 +1084,17 @@ async def chat_handler(request: ChatRequest):
 
             final_msg = (
                 f"{dashboard}\n\n"
-                f"🎉 Found **{len(formatted)} matches** for you!"
+                f"Found {len(formatted)} properties matching your criteria."
                 f"{rec_text}{t_text}"
             )
+            session_title = _generate_session_title(session)
             return JSONResponse(content={
-                "response":   final_msg,
-                "status":     "complete",
-                "properties": formatted,
-                "data":       session,
+                "response":      final_msg,
+                "status":        "complete",
+                "properties":    formatted,
+                "actions":       _build_actions("complete", session),
+                "session_title": session_title,
+                "data":          session,
             })
 
         elif user_wants_show and not has_enough_data:
@@ -674,14 +1112,25 @@ async def chat_handler(request: ChatRequest):
                 {"role": "user",      "content": msg},
                 {"role": "assistant", "content": reply},
             ]
-            return JSONResponse(content={"response": reply, "status": "incomplete", "data": session})
+            return JSONResponse(content={
+                "response": reply,
+                "status":   "incomplete",
+                "actions":  _build_actions("incomplete", session),
+                "data":     session,
+            })
 
         # Normal conversational turn
         session["history"] += [
             {"role": "user",      "content": msg},
             {"role": "assistant", "content": bot_reply},
         ]
-        return JSONResponse(content={"response": bot_reply, "status": "incomplete", "data": session})
+        return JSONResponse(content={
+            "response":      bot_reply,
+            "status":        "incomplete",
+            "actions":       _build_actions("incomplete", session),
+            "session_title": _generate_session_title(session),
+            "data":          session,
+        })
 
     except Exception:
         print("\n💥 FATAL UNHANDLED ERROR:")
